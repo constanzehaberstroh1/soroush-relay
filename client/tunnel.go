@@ -89,16 +89,24 @@ func startTunnel() error {
 }
 
 func stopTunnel() {
+	// Extract group bus state under lock, then release before network I/O
 	tunnel.mu.Lock()
+	gcID := tunnel.groupChatID
+	sess := tunnel.clientSession
+	cID := tunnel.clientAccountID
+	psk := tunnel.groupPSK
+	tunnel.mu.Unlock()
 
-	// Broadcast DISCONNECT to group before tearing down
-	if tunnel.groupChatID != 0 && tunnel.clientSession != nil && tunnel.clientAccountID != "" {
-		disc := soroushlib.NewDisconnect(tunnel.clientAccountID)
+	// Broadcast DISCONNECT outside of lock to avoid blocking UI polls
+	if gcID != 0 && sess != nil && cID != "" {
+		disc := soroushlib.NewDisconnect(cID)
 		discCtx, discCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		soroushlib.SendGroupCommand(discCtx, tunnel.clientSession, tunnel.groupChatID, disc, tunnel.groupPSK)
+		soroushlib.SendGroupCommand(discCtx, sess, gcID, disc, psk)
 		discCancel()
 	}
 
+	// Re-acquire lock for state teardown
+	tunnel.mu.Lock()
 	if tunnel.cancel != nil {
 		tunnel.cancel()
 	}
@@ -204,7 +212,11 @@ func runTunnelFlow(ctx context.Context, cancel context.CancelFunc) {
 					return
 				}
 				if cmd.Cmd == soroushlib.CmdOffer && cmd.CID == clientID {
-					offerCh <- cmd
+					// Non-blocking send: if multiple servers reply, take first, ignore rest
+					select {
+					case offerCh <- cmd:
+					default:
+					}
 				}
 			})
 		}()
@@ -435,13 +447,47 @@ func establishWebRTC(ctx context.Context, session *soroushlib.MTProtoSession) er
 
 	dc.OnClose(func() {
 		recordSystemLog("[WebRTC] Data channel closed", "warn")
+
 		tunnel.mu.Lock()
-		tunnel.phase = "idle"
+		wasConnected := tunnel.phase == "connected"
+		tunnel.phase = "reconnecting"
 		tunnel.mu.Unlock()
 
 		state.mu.Lock()
 		state.tunnelActive = false
 		state.mu.Unlock()
+
+		// Auto-reconnect if the tunnel was previously connected (not manually stopped)
+		if wasConnected {
+			addLog("WebRTC data channel lost. Auto-reconnecting in 3s...", "warn")
+			go func() {
+				time.Sleep(3 * time.Second)
+				tunnel.mu.Lock()
+				// Only reconnect if still in "reconnecting" (not manually stopped)
+				if tunnel.phase != "reconnecting" {
+					tunnel.mu.Unlock()
+					return
+				}
+				// Clean up old connection
+				if tunnel.peerConnection != nil {
+					tunnel.peerConnection.Close()
+					tunnel.peerConnection = nil
+				}
+				tunnel.dataChannel = nil
+				tunnel.phase = "dispatching"
+				ctx, cancel := context.WithCancel(context.Background())
+				tunnel.ctx = ctx
+				tunnel.cancel = cancel
+				tunnel.mu.Unlock()
+
+				state.mu.Lock()
+				state.connecting = true
+				state.mu.Unlock()
+
+				recordSystemLog("[Tunnel] Auto-reconnecting...", "info")
+				runTunnelFlow(ctx, cancel)
+			}()
+		}
 	})
 
 	// ── ICE connection state logging ──
@@ -604,8 +650,6 @@ func establishWebRTC(ctx context.Context, session *soroushlib.MTProtoSession) er
 							soroushlib.SendTextMessage(iceCtx, session, workerUID, workerAH, iceMsg)
 							iceCancel()
 						case <-sdpAnswerCtx.Done():
-							return
-						case <-time.After(3 * time.Second):
 							return
 						}
 					}

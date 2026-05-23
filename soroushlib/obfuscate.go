@@ -80,8 +80,9 @@ func EncodePayload(jsonBytes []byte, psk []byte) (string, error) {
 
 // DecodePayload extracts and decrypts the payload from a stealth-encoded message
 func DecodePayload(message string, psk []byte) ([]byte, error) {
-	// Find the bracketed payload
-	startIdx := strings.LastIndex(message, "[")
+	// Find the bracketed payload — use Index for '[' and LastIndex for ']'
+	// to handle any edge case where Persian prefix contains brackets
+	startIdx := strings.Index(message, "[")
 	endIdx := strings.LastIndex(message, "]")
 	if startIdx == -1 || endIdx == -1 || endIdx <= startIdx {
 		return nil, fmt.Errorf("no stealth payload found in message")
@@ -127,7 +128,7 @@ func DecodePayload(message string, psk []byte) ([]byte, error) {
 
 // IsStealthMessage checks if a message contains a stealth-encoded payload
 func IsStealthMessage(message string) bool {
-	startIdx := strings.LastIndex(message, "[")
+	startIdx := strings.Index(message, "[")
 	endIdx := strings.LastIndex(message, "]")
 	if startIdx == -1 || endIdx == -1 || endIdx <= startIdx {
 		return false

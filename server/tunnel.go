@@ -187,21 +187,23 @@ func runGroupObserver(ctx context.Context) {
 				if _, ok := repliedDiscovers[cmd.CID]; ok {
 					return
 				}
+				repliedDiscovers[cmd.CID] = time.Now()
 
-				// Random delay to prevent race conditions (0-500ms)
-				delay := time.Duration(rand.Intn(500)) * time.Millisecond
-				time.Sleep(delay)
+				// Run in goroutine to avoid blocking the message listener
+				go func(targetCID string) {
+					// Random delay to prevent race conditions (0-500ms)
+					delay := time.Duration(rand.Intn(500)) * time.Millisecond
+					time.Sleep(delay)
 
-				// Send OFFER
-				offer := soroushlib.NewOffer(cmd.CID, serverID, account.SoroushUserID, account.AccessHash)
-				offerCtx, offerCancel := context.WithTimeout(ctx, 10*time.Second)
-				if err := soroushlib.SendGroupCommand(offerCtx, session, chatID, offer, psk); err != nil {
-					recordSystemLog(fmt.Sprintf("[GroupObserver] Failed to send OFFER: %v", err), "error")
-				} else {
-					recordSystemLog(fmt.Sprintf("[GroupObserver] Sent OFFER to client %s", cmd.CID), "success")
-					repliedDiscovers[cmd.CID] = time.Now()
-				}
-				offerCancel()
+					offer := soroushlib.NewOffer(targetCID, serverID, account.SoroushUserID, account.AccessHash)
+					offerCtx, offerCancel := context.WithTimeout(ctx, 10*time.Second)
+					defer offerCancel()
+					if err := soroushlib.SendGroupCommand(offerCtx, session, chatID, offer, psk); err != nil {
+						recordSystemLog(fmt.Sprintf("[GroupObserver] Failed to send OFFER: %v", err), "error")
+					} else {
+						recordSystemLog(fmt.Sprintf("[GroupObserver] Sent OFFER to client %s", targetCID), "success")
+					}
+				}(cmd.CID)
 
 			case soroushlib.CmdCalling:
 				// Client is calling us — prepare for incoming WebRTC call
@@ -226,6 +228,14 @@ func runGroupObserver(ctx context.Context) {
 			hbCtx, hbCancel := context.WithTimeout(ctx, 10*time.Second)
 			soroushlib.SendGroupCommand(hbCtx, session, chatID, hb, psk)
 			hbCancel()
+
+			// Prune stale repliedDiscovers entries (older than 5 minutes)
+			now := time.Now()
+			for k, v := range repliedDiscovers {
+				if now.Sub(v) > 5*time.Minute {
+					delete(repliedDiscovers, k)
+				}
+			}
 		case err := <-errCh:
 			if err != nil && ctx.Err() == nil {
 				recordSystemLog(fmt.Sprintf("[GroupObserver] Listen error: %v", err), "error")
@@ -526,7 +536,7 @@ func handleIncomingCall(ctx context.Context, session *soroushlib.MTProtoSession,
 				sendCancel()
 				recordSystemLog(fmt.Sprintf("[Worker %s] SDP answer sent (%d bytes)", account.PhoneNumber, len(answer.SDP)), "success")
 
-				// Send buffered ICE candidates
+				// Send buffered ICE candidates (context-managed, no premature timeout)
 				go func() {
 					time.Sleep(500 * time.Millisecond)
 					for {
@@ -537,8 +547,6 @@ func handleIncomingCall(ctx context.Context, session *soroushlib.MTProtoSession,
 							soroushlib.SendTextMessage(iceCtx, session, callEvent.AdminID, 0, iceMsg)
 							iceCancel()
 						case <-sdpCtx.Done():
-							return
-						case <-time.After(3 * time.Second):
 							return
 						}
 					}
