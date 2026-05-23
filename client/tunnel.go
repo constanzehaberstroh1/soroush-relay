@@ -502,7 +502,20 @@ func establishWebRTC(ctx context.Context, session *soroushlib.MTProtoSession) er
 		recordSystemLog(fmt.Sprintf("[WebRTC] Connection state: %s", state.String()), "info")
 	})
 
-	// ── Generate SDP Offer ──
+	// ── Trickle ICE: Register candidate handler BEFORE generating offer ──
+	// Candidates are collected and sent to the worker after SDP answer is received
+	pendingICE := make(chan string, 32)
+	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+		if c == nil {
+			return
+		}
+		select {
+		case pendingICE <- c.ToJSON().Candidate:
+		default:
+		}
+	})
+
+	// ── Generate SDP Offer (bare, without waiting for ICE gathering) ──
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
 		return fmt.Errorf("create offer: %w", err)
@@ -511,18 +524,11 @@ func establishWebRTC(ctx context.Context, session *soroushlib.MTProtoSession) er
 		return fmt.Errorf("set local description: %w", err)
 	}
 
-	// Wait for ICE gathering to complete
-	gatherComplete := webrtc.GatheringCompletePromise(pc)
-	select {
-	case <-gatherComplete:
-	case <-time.After(15 * time.Second):
-		recordSystemLog("[WebRTC] ICE gathering timeout, proceeding with partial candidates", "warn")
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	// NOTE: No GatheringCompletePromise wait! Trickle ICE sends candidates
+	// asynchronously via direct messages after SDP answer is received.
 
 	localDesc := pc.LocalDescription()
-	recordSystemLog(fmt.Sprintf("[WebRTC] SDP Offer generated (%d bytes)", len(localDesc.SDP)), "success")
+	recordSystemLog(fmt.Sprintf("[WebRTC] SDP Offer generated (%d bytes). Trickle ICE active.", len(localDesc.SDP)), "success")
 
 	// ── Step 7: Send call via Soroush signaling ──
 	// Generate DH parameters for the call encryption handshake
@@ -607,17 +613,7 @@ func establishWebRTC(ctx context.Context, session *soroushlib.MTProtoSession) er
 	sdpAnswerCtx, sdpAnswerCancel := context.WithTimeout(ctx, 30*time.Second)
 	answerDone := make(chan bool, 1)
 
-	// Collect our ICE candidates to send to the worker
-	pendingICE := make(chan string, 32)
-	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
-		if c == nil {
-			return
-		}
-		select {
-		case pendingICE <- c.ToJSON().Candidate:
-		default:
-		}
-	})
+	// pendingICE channel is already populated by OnICECandidate registered above
 
 	go func() {
 		soroushlib.ListenForMessages(sdpAnswerCtx, session, func(msg soroushlib.IncomingMessage) {
