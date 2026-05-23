@@ -35,6 +35,7 @@ type DBSoroushAccount struct {
 	ServerSalt    []byte    `gorm:"type:blob" json:"-"`
 	SessionData   string    `gorm:"type:text" json:"-"`
 	DcID          int       `json:"dcId"`
+	Role          string    `gorm:"default:''" json:"role"` // "dispatcher", "worker", or ""
 	Status        string    `gorm:"default:'idle'" json:"status"`
 	LastActive    string    `json:"lastActive"`
 	CreatedAt     time.Time `json:"createdAt"`

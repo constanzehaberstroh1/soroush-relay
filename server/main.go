@@ -114,6 +114,12 @@ func main() {
 	mux.HandleFunc("/api/accounts", JWTMiddleware(handleAccounts))
 	mux.HandleFunc("/api/accounts/request-otp", JWTMiddleware(handleRequestOTP))
 	mux.HandleFunc("/api/accounts/verify-otp", JWTMiddleware(handleVerifyOTP))
+	mux.HandleFunc("/api/accounts/set-role", JWTMiddleware(handleSetAccountRole))
+	mux.HandleFunc("/api/tunnel/start", JWTMiddleware(handleServerTunnelStart))
+	mux.HandleFunc("/api/tunnel/stop", JWTMiddleware(handleServerTunnelStop))
+	mux.HandleFunc("/api/tunnel/status", JWTMiddleware(handleServerTunnelStatus))
+	mux.HandleFunc("/api/infra/test", JWTMiddleware(handleInfraTest))
+	mux.HandleFunc("/api/infra/status", JWTMiddleware(handleInfraStatus))
 	mux.HandleFunc("/api/logs", JWTMiddleware(handleGetLogs))
 
 	// CORS Preflight handler
@@ -218,11 +224,12 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 }
 
-// Soroush Signaling WebSocket Handler placeholder
+// Soroush Signaling WebSocket Handler
 func handleSignalingWS(w http.ResponseWriter, r *http.Request) {
-	fmt.Printf("[SignalingWS] Soroush client handshake requested from IP %s. Upgrading connection...\n", r.RemoteAddr)
-	w.WriteHeader(http.StatusNotImplemented)
-	w.Write([]byte("Soroush signaling websocket protocol requires Go phase 2 implementation."))
+	fmt.Printf("[SignalingWS] Soroush client handshake requested from IP %s.\n", r.RemoteAddr)
+	// The real signaling is handled through the MTProto session in tunnel.go
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Signaling handled via MTProto tunnel engine."))
 }
 
 // DB-backed Soroush Accounts handler for server side exit routing

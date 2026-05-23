@@ -47,6 +47,15 @@ import {
   Delete as DeleteIcon,
   AccountCircle as AccountIcon,
   Refresh as RefreshIcon,
+  NetworkCheck as NetworkCheckIcon,
+  CheckCircle as CheckCircleIcon,
+  Cancel as CancelIcon,
+  Warning as WarningIcon,
+  PlayArrow as PlayArrowIcon,
+  Storage as StorageIcon,
+  VpnKey as VpnKeyIcon,
+  Wifi as WifiIcon,
+  CloudDone as CloudDoneIcon,
 } from '@mui/icons-material';
 import { lightTheme, darkTheme } from './theme';
 import {
@@ -91,9 +100,19 @@ interface SoroushAccount {
   displayName: string;
   accessHash: number;
   dcId: number;
+  role: string;
   status: 'connected' | 'error' | 'idle';
   lastActive: string;
   createdAt: string;
+}
+
+interface InfraTestResult {
+  name: string;
+  description: string;
+  status: 'testing' | 'pass' | 'fail' | 'warn';
+  latencyMs: number;
+  detail: string;
+  category: 'network' | 'auth' | 'turn' | 'database';
 }
 
 interface LogEntry {
@@ -189,6 +208,13 @@ function RootLayout() {
               style={{ textDecoration: 'none', color: theme.palette.text.secondary, padding: '8px 16px', borderRadius: '8px', display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.85rem', fontWeight: 500 }}
             >
               <SettingsIcon fontSize="small" /> Gateway Settings
+            </Link>
+            <Link
+              to="/infrastructure"
+              activeProps={{ style: { color: theme.palette.primary.main, fontWeight: 700, backgroundColor: 'rgba(124, 58, 237, 0.08)' } }}
+              style={{ textDecoration: 'none', color: theme.palette.text.secondary, padding: '8px 16px', borderRadius: '8px', display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.85rem', fontWeight: 500 }}
+            >
+              <NetworkCheckIcon fontSize="small" /> Infrastructure
             </Link>
             <Link
               to="/logs"
@@ -783,7 +809,362 @@ function ConfigView() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Page 4: Logs View (Live polled backend signaling logs)
+// Page 5: Infrastructure Diagnostics View
+// ──────────────────────────────────────────────────────────────────────────────
+
+const categoryMeta: Record<string, { icon: React.ReactNode; label: string; color: string }> = {
+  network: { icon: <WifiIcon />, label: 'Network Connectivity', color: '#22d3ee' },
+  auth: { icon: <VpnKeyIcon />, label: 'Authentication & Accounts', color: '#a78bfa' },
+  turn: { icon: <CloudDoneIcon />, label: 'TURN/STUN Relay Servers', color: '#f59e0b' },
+  database: { icon: <StorageIcon />, label: 'Database Storage', color: '#10b981' },
+};
+
+function InfraTestView() {
+  const [results, setResults] = useState<InfraTestResult[]>([]);
+  const [testing, setTesting] = useState<boolean>(false);
+  const [lastTested, setLastTested] = useState<string>('');
+  const [cachedLoaded, setCachedLoaded] = useState<boolean>(false);
+
+  // Load cached results on mount
+  useEffect(() => {
+    const loadCached = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/infra/status`, { headers: getHeaders() });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.tested && data.results) {
+            setResults(data.results);
+            setLastTested(data.testedAt || '');
+            setCachedLoaded(true);
+          }
+        }
+      } catch { /* ignore */ }
+    };
+    loadCached();
+  }, []);
+
+  const runTests = async () => {
+    setTesting(true);
+    setResults([]);
+    try {
+      const res = await fetch(`${API_BASE}/infra/test`, {
+        method: 'POST',
+        headers: getHeaders(),
+      });
+      if (res.ok) {
+        const data: InfraTestResult[] = await res.json();
+        setResults(data);
+        setLastTested(new Date().toISOString());
+      }
+    } catch (err) {
+      console.error('Infrastructure test failed:', err);
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const passCount = results.filter(r => r.status === 'pass').length;
+  const failCount = results.filter(r => r.status === 'fail').length;
+  const warnCount = results.filter(r => r.status === 'warn').length;
+  const totalCount = results.length;
+
+  const overallHealth = totalCount === 0
+    ? 'unknown'
+    : failCount > 0
+    ? 'critical'
+    : warnCount > 0
+    ? 'degraded'
+    : 'healthy';
+
+  const healthColors: Record<string, string> = {
+    unknown: '#475569',
+    healthy: '#10b981',
+    degraded: '#f59e0b',
+    critical: '#ef4444',
+  };
+
+  // Group results by category
+  const grouped = results.reduce<Record<string, InfraTestResult[]>>((acc, r) => {
+    if (!acc[r.category]) acc[r.category] = [];
+    acc[r.category].push(r);
+    return acc;
+  }, {});
+
+  const StatusIcon = ({ status }: { status: string }) => {
+    switch (status) {
+      case 'pass':
+        return <CheckCircleIcon sx={{ color: '#10b981', fontSize: 22 }} />;
+      case 'fail':
+        return <CancelIcon sx={{ color: '#ef4444', fontSize: 22 }} />;
+      case 'warn':
+        return <WarningIcon sx={{ color: '#f59e0b', fontSize: 22 }} />;
+      default:
+        return <CircularProgress size={18} />;
+    }
+  };
+
+  return (
+    <Box display="flex" flexDirection="column" gap={3}>
+      {/* Header Card with overall health status */}
+      <Card sx={{ overflow: 'visible' }}>
+        <CardContent>
+          <Box display="flex" alignItems="center" justifyContent="space-between" flexWrap="wrap" gap={2}>
+            <Box display="flex" alignItems="center" gap={2}>
+              <Box
+                sx={{
+                  width: 56,
+                  height: 56,
+                  borderRadius: 3,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  background: `linear-gradient(135deg, ${healthColors[overallHealth]}22, ${healthColors[overallHealth]}08)`,
+                  border: `1px solid ${healthColors[overallHealth]}33`,
+                  boxShadow: `0 0 20px ${healthColors[overallHealth]}15`,
+                }}
+              >
+                <NetworkCheckIcon sx={{ color: healthColors[overallHealth], fontSize: 28 }} />
+              </Box>
+              <Box>
+                <Typography variant="h6" fontWeight={800}>
+                  Soroush Infrastructure Diagnostics
+                </Typography>
+                <Typography variant="body2" color="text.secondary">
+                  Test all Soroush-related services and dependencies to verify server readiness
+                </Typography>
+              </Box>
+            </Box>
+
+            <Box display="flex" alignItems="center" gap={2}>
+              {totalCount > 0 && (
+                <Box display="flex" gap={1.5} alignItems="center">
+                  <Box
+                    sx={{
+                      px: 1.5, py: 0.5, borderRadius: 2,
+                      bgcolor: 'rgba(16, 185, 129, 0.1)',
+                      border: '1px solid rgba(16, 185, 129, 0.2)',
+                      display: 'flex', alignItems: 'center', gap: 0.5,
+                    }}
+                  >
+                    <CheckCircleIcon sx={{ color: '#10b981', fontSize: 16 }} />
+                    <Typography variant="caption" fontWeight={700} color="#10b981">{passCount}</Typography>
+                  </Box>
+                  {warnCount > 0 && (
+                    <Box
+                      sx={{
+                        px: 1.5, py: 0.5, borderRadius: 2,
+                        bgcolor: 'rgba(245, 158, 11, 0.1)',
+                        border: '1px solid rgba(245, 158, 11, 0.2)',
+                        display: 'flex', alignItems: 'center', gap: 0.5,
+                      }}
+                    >
+                      <WarningIcon sx={{ color: '#f59e0b', fontSize: 16 }} />
+                      <Typography variant="caption" fontWeight={700} color="#f59e0b">{warnCount}</Typography>
+                    </Box>
+                  )}
+                  {failCount > 0 && (
+                    <Box
+                      sx={{
+                        px: 1.5, py: 0.5, borderRadius: 2,
+                        bgcolor: 'rgba(239, 68, 68, 0.1)',
+                        border: '1px solid rgba(239, 68, 68, 0.2)',
+                        display: 'flex', alignItems: 'center', gap: 0.5,
+                      }}
+                    >
+                      <CancelIcon sx={{ color: '#ef4444', fontSize: 16 }} />
+                      <Typography variant="caption" fontWeight={700} color="#ef4444">{failCount}</Typography>
+                    </Box>
+                  )}
+                </Box>
+              )}
+
+              <Button
+                customVariant="glow"
+                startIcon={testing ? <CircularProgress size={18} color="inherit" /> : <PlayArrowIcon />}
+                onClick={runTests}
+                disabled={testing}
+                style={{ minWidth: 160 }}
+              >
+                {testing ? 'Running Tests...' : 'Run All Tests'}
+              </Button>
+            </Box>
+          </Box>
+
+          {lastTested && (
+            <Typography variant="caption" color="text.secondary" sx={{ mt: 1.5, display: 'block' }}>
+              Last tested: {new Date(lastTested).toLocaleString()}
+            </Typography>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Overall health bar */}
+      {totalCount > 0 && (
+        <Box
+          sx={{
+            height: 6,
+            borderRadius: 3,
+            overflow: 'hidden',
+            display: 'flex',
+            bgcolor: 'rgba(255,255,255,0.04)',
+          }}
+        >
+          <Box sx={{ width: `${(passCount / totalCount) * 100}%`, bgcolor: '#10b981', transition: 'width 0.5s' }} />
+          <Box sx={{ width: `${(warnCount / totalCount) * 100}%`, bgcolor: '#f59e0b', transition: 'width 0.5s' }} />
+          <Box sx={{ width: `${(failCount / totalCount) * 100}%`, bgcolor: '#ef4444', transition: 'width 0.5s' }} />
+        </Box>
+      )}
+
+      {/* Testing skeleton */}
+      {testing && results.length === 0 && (
+        <Card>
+          <CardContent>
+            <Box display="flex" flexDirection="column" alignItems="center" py={6} gap={2}>
+              <CircularProgress size={48} color="primary" />
+              <Typography variant="body1" fontWeight={600}>
+                Probing Soroush Infrastructure...
+              </Typography>
+              <Typography variant="body2" color="text.secondary">
+                Testing WebSocket gateway, TURN/STUN servers, MTProto handshake, database, and account health
+              </Typography>
+            </Box>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Empty state */}
+      {!testing && results.length === 0 && !cachedLoaded && (
+        <Card>
+          <CardContent>
+            <Box display="flex" flexDirection="column" alignItems="center" py={8} gap={2}>
+              <NetworkCheckIcon sx={{ fontSize: 64, opacity: 0.12, color: 'text.secondary' }} />
+              <Typography variant="h6" fontWeight={600} color="text.secondary">
+                No Test Results Yet
+              </Typography>
+              <Typography variant="body2" color="text.secondary" textAlign="center" maxWidth={440}>
+                Click "Run All Tests" to probe all Soroush infrastructure components and verify this server has full access to the messaging network.
+              </Typography>
+            </Box>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Grouped results */}
+      {Object.entries(grouped).map(([category, items]) => {
+        const meta = categoryMeta[category] || { icon: <ServerIcon />, label: category, color: '#94a3b8' };
+        const catPass = items.filter(i => i.status === 'pass').length;
+        const catTotal = items.length;
+
+        return (
+          <Card key={category}>
+            <CardContent>
+              <Box display="flex" alignItems="center" justifyContent="space-between" mb={2}>
+                <Box display="flex" alignItems="center" gap={1.5}>
+                  <Box
+                    sx={{
+                      width: 36,
+                      height: 36,
+                      borderRadius: 2,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      bgcolor: `${meta.color}15`,
+                      color: meta.color,
+                    }}
+                  >
+                    {meta.icon}
+                  </Box>
+                  <Typography variant="subtitle1" fontWeight={700}>
+                    {meta.label}
+                  </Typography>
+                </Box>
+                <Typography variant="caption" color="text.secondary" fontWeight={600}>
+                  {catPass}/{catTotal} passed
+                </Typography>
+              </Box>
+
+              <Box display="flex" flexDirection="column" gap={1}>
+                {items.map((item, idx) => (
+                  <Box
+                    key={idx}
+                    sx={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 2,
+                      px: 2,
+                      py: 1.5,
+                      borderRadius: 2,
+                      bgcolor: item.status === 'pass'
+                        ? 'rgba(16, 185, 129, 0.04)'
+                        : item.status === 'fail'
+                        ? 'rgba(239, 68, 68, 0.04)'
+                        : item.status === 'warn'
+                        ? 'rgba(245, 158, 11, 0.04)'
+                        : 'transparent',
+                      border: '1px solid',
+                      borderColor: item.status === 'pass'
+                        ? 'rgba(16, 185, 129, 0.12)'
+                        : item.status === 'fail'
+                        ? 'rgba(239, 68, 68, 0.12)'
+                        : item.status === 'warn'
+                        ? 'rgba(245, 158, 11, 0.12)'
+                        : 'rgba(255,255,255,0.04)',
+                      transition: 'all 0.3s ease',
+                    }}
+                  >
+                    <StatusIcon status={item.status} />
+
+                    <Box flex={1} minWidth={0}>
+                      <Box display="flex" alignItems="center" gap={1}>
+                        <Typography variant="body2" fontWeight={600} noWrap>
+                          {item.name}
+                        </Typography>
+                        {item.latencyMs > 0 && (
+                          <Typography
+                            variant="caption"
+                            sx={{
+                              px: 1,
+                              py: 0.25,
+                              borderRadius: 1,
+                              bgcolor: 'rgba(255,255,255,0.05)',
+                              fontFamily: 'monospace',
+                              fontWeight: 600,
+                              color: item.latencyMs < 100 ? '#10b981'
+                                : item.latencyMs < 500 ? '#f59e0b'
+                                : '#ef4444',
+                            }}
+                          >
+                            {item.latencyMs}ms
+                          </Typography>
+                        )}
+                      </Box>
+                      <Typography variant="caption" color="text.secondary" noWrap>
+                        {item.detail || item.description}
+                      </Typography>
+                    </Box>
+
+                    <Badge
+                      label={item.status.toUpperCase()}
+                      customVariant={
+                        item.status === 'pass' ? 'online'
+                        : item.status === 'fail' ? 'offline'
+                        : item.status === 'warn' ? 'connecting'
+                        : 'idle'
+                      }
+                    />
+                  </Box>
+                ))}
+              </Box>
+            </CardContent>
+          </Card>
+        );
+      })}
+    </Box>
+  );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Page 6: Logs View (Live polled backend signaling logs)
 // ──────────────────────────────────────────────────────────────────────────────
 function LogsView() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -1020,7 +1401,13 @@ const logsRoute = createRoute({
   component: LogsView,
 });
 
-const routeTree = rootRoute.addChildren([indexRoute, accountsRoute, configRoute, logsRoute]);
+const infraRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/infrastructure',
+  component: InfraTestView,
+});
+
+const routeTree = rootRoute.addChildren([indexRoute, accountsRoute, configRoute, infraRoute, logsRoute]);
 
 const router = createRouter({ routeTree });
 

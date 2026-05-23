@@ -92,8 +92,10 @@ func main() {
 	// Protected Admin endpoints
 	mux.HandleFunc("/api/admin/me", JWTMiddleware(handleAdminMe))
 	mux.HandleFunc("/api/status", JWTMiddleware(handleStatus))
-	mux.HandleFunc("/api/start", JWTMiddleware(handleStart))
-	mux.HandleFunc("/api/stop", JWTMiddleware(handleStop))
+	mux.HandleFunc("/api/start", JWTMiddleware(handleTunnelStart))
+	mux.HandleFunc("/api/stop", JWTMiddleware(handleTunnelStop))
+	mux.HandleFunc("/api/tunnel/status", JWTMiddleware(handleTunnelStatus))
+	mux.HandleFunc("/api/tunnel/config", JWTMiddleware(handleTunnelConfig))
 	mux.HandleFunc("/api/accounts", JWTMiddleware(handleAccounts))
 	mux.HandleFunc("/api/accounts/request-otp", JWTMiddleware(handleRequestOTP))
 	mux.HandleFunc("/api/accounts/verify-otp", JWTMiddleware(handleVerifyOTP))
@@ -171,61 +173,8 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(res)
 }
 
-func handleStart(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"Method not allowed"}`, http.StatusMethodNotAllowed)
-		return
-	}
-
-	state.mu.Lock()
-	if state.tunnelActive {
-		state.mu.Unlock()
-		http.Error(w, `{"error":"Tunnel already active"}`, http.StatusBadRequest)
-		return
-	}
-	state.connecting = true
-	state.mu.Unlock()
-
-	addLog("Connecting Soroush API WebSocket handshake...", "info")
-
-	// Simulate connection asynchronous delay
-	go func() {
-		time.Sleep(1 * time.Second)
-		addLog("apiws WebSocket established successfully", "success")
-		time.Sleep(1 * time.Second)
-		addLog("Received WebRTC SDP Offer from Soroush Server", "success")
-		time.Sleep(1 * time.Second)
-
-		state.mu.Lock()
-		state.connecting = false
-		state.tunnelActive = true
-		state.startedAt = time.Now()
-		state.mu.Unlock()
-
-		addLog("Traffic successfully obfuscated as Soroush voice call payload!", "success")
-		addLog("SOCKS5 Proxy interface listening on port 4046", "success")
-	}()
-
-	w.WriteHeader(http.StatusAccepted)
-	w.Write([]byte(`{"message": "Tunnel connection initiated"}`))
-}
-
-func handleStop(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"Method not allowed"}`, http.StatusMethodNotAllowed)
-		return
-	}
-
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	state.tunnelActive = false
-	state.connecting = false
-	addLog("Closing WebRTC data channel...", "info")
-	addLog("Soroush WebRTC Tunnel stopped safely.", "warn")
-
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"message": "Tunnel closed"}`))
-}
+// handleStart and handleStop are now handled by tunnel.go
+// (handleTunnelStart and handleTunnelStop)
 
 // DB-backed Soroush Accounts handler
 func handleAccounts(w http.ResponseWriter, r *http.Request) {

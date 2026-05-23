@@ -39,6 +39,13 @@ type DBSoroushAccount struct {
 	CreatedAt     time.Time `json:"createdAt"`
 }
 
+// DBTunnelConfig stores the dispatcher account configuration
+type DBTunnelConfig struct {
+	ID                   uint  `gorm:"primaryKey" json:"id"`
+	DispatcherUserID     int64 `json:"dispatcherUserId"`
+	DispatcherAccessHash int64 `json:"dispatcherAccessHash"`
+}
+
 // Initialize SQLite database
 func initDB() {
 	var err error
@@ -51,7 +58,7 @@ func initDB() {
 	fmt.Println("[DB] SQLite database initialized successfully: client_config.db")
 
 	// Auto migrate tables
-	err = db.AutoMigrate(&DBAdmin{}, &DBSoroushAccount{})
+	err = db.AutoMigrate(&DBAdmin{}, &DBSoroushAccount{}, &DBTunnelConfig{})
 	if err != nil {
 		log.Fatalf("[DB] Database migration failed: %v", err)
 	}
