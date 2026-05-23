@@ -611,3 +611,65 @@ func handleTunnelConfig(w http.ResponseWriter, r *http.Request) {
 
 	http.Error(w, `{"error":"Method not allowed"}`, http.StatusMethodNotAllowed)
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Server Connectivity Test — Pings the Clever Cloud server directly
+// ──────────────────────────────────────────────────────────────────────────────
+
+func handleTestServerConnection(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		ServerURL string `json:"serverUrl"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ServerURL == "" {
+		http.Error(w, `{"error":"serverUrl is required"}`, http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	// Ping the server's public /api/ping endpoint
+	pingURL := req.ServerURL + "/api/ping"
+	addLog(fmt.Sprintf("Testing server connectivity: %s", pingURL), "info")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	start := time.Now()
+	resp, err := client.Get(pingURL)
+	latency := time.Since(start).Milliseconds()
+
+	if err != nil {
+		addLog(fmt.Sprintf("Server connection FAILED: %v", err), "error")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   false,
+			"error":     err.Error(),
+			"latencyMs": latency,
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	var serverResp map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&serverResp)
+
+	if resp.StatusCode == 200 {
+		addLog(fmt.Sprintf("✅ Server connection OK! Latency: %dms, Version: %v", latency, serverResp["version"]), "success")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":    true,
+			"latencyMs":  latency,
+			"statusCode": resp.StatusCode,
+			"server":     serverResp,
+		})
+	} else {
+		addLog(fmt.Sprintf("⚠️ Server responded with HTTP %d (latency: %dms)", resp.StatusCode, latency), "warn")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":    false,
+			"latencyMs":  latency,
+			"statusCode": resp.StatusCode,
+			"error":      fmt.Sprintf("Unexpected HTTP %d", resp.StatusCode),
+		})
+	}
+}

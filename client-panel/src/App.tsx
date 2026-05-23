@@ -707,77 +707,192 @@ function SettingsView() {
   const [exitPort, setExitPort] = useState<number>(8080);
   const [obfuscation, setObfuscation] = useState<string>('voice');
 
+  // Server connectivity test
+  const [serverUrl, setServerUrl] = useState<string>(() => {
+    return localStorage.getItem('server-exit-url') || 'https://app-25d61cc9-bc8f-4d35-8fd8-c1a24ad4abb7.cleverapps.io';
+  });
+  const [testResult, setTestResult] = useState<any>(null);
+  const [testing, setTesting] = useState(false);
+
   const handleSave = () => {
-    alert('Relay and Obfuscator settings applied dynamically.');
+    localStorage.setItem('server-exit-url', serverUrl);
+    alert('Settings saved.');
+  };
+
+  const handleTestConnection = async () => {
+    setTesting(true);
+    setTestResult(null);
+    localStorage.setItem('server-exit-url', serverUrl);
+    try {
+      const res = await fetch(`${API_BASE}/test-server`, {
+        method: 'POST',
+        headers: getHeaders(),
+        body: JSON.stringify({ serverUrl }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setTestResult(data);
+      } else {
+        setTestResult({ success: false, error: 'Client backend returned an error' });
+      }
+    } catch (err) {
+      setTestResult({ success: false, error: 'Failed to reach client backend' });
+    } finally {
+      setTesting(false);
+    }
   };
 
   return (
-    <Card>
-      <CardContent>
-        <Typography variant="h6" fontWeight={700} mb={1}>
-          Relay Config & Routing Settings
-        </Typography>
-        <Typography variant="body2" color="text.secondary" mb={3}>
-          Configure signaling targets, local ports, and WebRTC masquerade algorithms.
-        </Typography>
+    <Box display="flex" flexDirection="column" gap={3}>
+      {/* Server Connectivity Test Card */}
+      <Card>
+        <CardContent>
+          <Box display="flex" alignItems="center" justifyContent="space-between" mb={1}>
+            <Typography variant="h6" fontWeight={700}>
+              Server Connection Test
+            </Typography>
+            <NetworkIcon color="secondary" />
+          </Box>
+          <Typography variant="body2" color="text.secondary" mb={3}>
+            Verify that this client machine can reach the Clever Cloud exit node server over HTTPS.
+          </Typography>
 
-        <Divider sx={{ mb: 3 }} />
+          <Divider sx={{ mb: 3 }} />
 
-        <Grid container spacing={3}>
-          <Grid item xs={12} sm={6}>
-            <TextField
-              label="Local SOCKS5 Listener Port"
-              type="number"
-              value={socksPort}
-              onChange={(e) => setSocksPort(Number(e.target.value))}
-              fullWidth
-              size="small"
-            />
-          </Grid>
-          <Grid item xs={12} sm={6}>
-            <TextField
-              label="Soroush Masquerading Type"
-              select
-              value={obfuscation}
-              onChange={(e) => setObfuscation(e.target.value)}
-              SelectProps={{ native: true }}
-              fullWidth
-              size="small"
-            >
-              <option value="voice">Audio Voice Calling emulation (Highly Resilient)</option>
-              <option value="video">H.264 Video Chat simulation</option>
-              <option value="files">Standard file transfers channel</option>
-            </TextField>
-          </Grid>
-
-          <Grid item xs={12} sm={8}>
-            <TextField
-              label="Target Soroush Server Exit Node (IP / Hostname)"
-              value={exitIP}
-              onChange={(e) => setExitIP(e.target.value)}
-              fullWidth
-              size="small"
-            />
-          </Grid>
-          <Grid item xs={12} sm={4}>
-            <TextField
-              label="Target Service Port"
-              type="number"
-              value={exitPort}
-              onChange={(e) => setExitPort(Number(e.target.value))}
-              fullWidth
-              size="small"
-            />
+          <Grid container spacing={2} alignItems="flex-end">
+            <Grid item xs={12} sm={8}>
+              <TextField
+                label="Server Exit Node URL"
+                placeholder="https://your-app.cleverapps.io"
+                value={serverUrl}
+                onChange={(e) => setServerUrl(e.target.value)}
+                fullWidth
+                size="small"
+                disabled={testing}
+              />
+            </Grid>
+            <Grid item xs={12} sm={4}>
+              <Button
+                customVariant="glow"
+                onClick={handleTestConnection}
+                disabled={testing || !serverUrl}
+                fullWidth
+                startIcon={testing ? <CircularProgress size={18} color="inherit" /> : <RefreshIcon />}
+              >
+                {testing ? 'Testing...' : 'Test Connection'}
+              </Button>
+            </Grid>
           </Grid>
 
-          <Grid item xs={12}>
-            <Button customVariant="primary" startIcon={<StartIcon />} onClick={handleSave}>
-              Apply Specifications
-            </Button>
+          {testResult && (
+            <Box mt={3}>
+              {testResult.success ? (
+                <Alert
+                  severity="success"
+                  sx={{ borderRadius: 2 }}
+                  icon={<NetworkIcon />}
+                >
+                  <Box>
+                    <Typography variant="body2" fontWeight={700}>
+                      ✅ Server is reachable!
+                    </Typography>
+                    <Typography variant="caption" component="div" sx={{ mt: 0.5 }}>
+                      Latency: <strong>{testResult.latencyMs}ms</strong>
+                      {testResult.server?.version && (
+                        <> · Version: <strong>{testResult.server.version}</strong></>
+                      )}
+                      {testResult.server?.timestamp && (
+                        <> · Server Time: {new Date(testResult.server.timestamp).toLocaleString()}</>
+                      )}
+                    </Typography>
+                  </Box>
+                </Alert>
+              ) : (
+                <Alert severity="error" sx={{ borderRadius: 2 }}>
+                  <Box>
+                    <Typography variant="body2" fontWeight={700}>
+                      ❌ Connection Failed
+                    </Typography>
+                    <Typography variant="caption" component="div" sx={{ mt: 0.5, wordBreak: 'break-all' }}>
+                      {testResult.error}
+                      {testResult.latencyMs > 0 && <> (after {testResult.latencyMs}ms)</>}
+                    </Typography>
+                  </Box>
+                </Alert>
+              )}
+            </Box>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Relay Settings Card */}
+      <Card>
+        <CardContent>
+          <Typography variant="h6" fontWeight={700} mb={1}>
+            Relay Config & Routing Settings
+          </Typography>
+          <Typography variant="body2" color="text.secondary" mb={3}>
+            Configure signaling targets, local ports, and WebRTC masquerade algorithms.
+          </Typography>
+
+          <Divider sx={{ mb: 3 }} />
+
+          <Grid container spacing={3}>
+            <Grid item xs={12} sm={6}>
+              <TextField
+                label="Local SOCKS5 Listener Port"
+                type="number"
+                value={socksPort}
+                onChange={(e) => setSocksPort(Number(e.target.value))}
+                fullWidth
+                size="small"
+              />
+            </Grid>
+            <Grid item xs={12} sm={6}>
+              <TextField
+                label="Soroush Masquerading Type"
+                select
+                value={obfuscation}
+                onChange={(e) => setObfuscation(e.target.value)}
+                SelectProps={{ native: true }}
+                fullWidth
+                size="small"
+              >
+                <option value="voice">Audio Voice Calling emulation (Highly Resilient)</option>
+                <option value="video">H.264 Video Chat simulation</option>
+                <option value="files">Standard file transfers channel</option>
+              </TextField>
+            </Grid>
+
+            <Grid item xs={12} sm={8}>
+              <TextField
+                label="Target Soroush Server Exit Node (IP / Hostname)"
+                value={exitIP}
+                onChange={(e) => setExitIP(e.target.value)}
+                fullWidth
+                size="small"
+              />
+            </Grid>
+            <Grid item xs={12} sm={4}>
+              <TextField
+                label="Target Service Port"
+                type="number"
+                value={exitPort}
+                onChange={(e) => setExitPort(Number(e.target.value))}
+                fullWidth
+                size="small"
+              />
+            </Grid>
+
+            <Grid item xs={12}>
+              <Button customVariant="primary" startIcon={<StartIcon />} onClick={handleSave}>
+                Apply Specifications
+              </Button>
+            </Grid>
           </Grid>
-        </Grid>
-      </CardContent>
-    </Card>
+        </CardContent>
+      </Card>
+    </Box>
   );
 }
 

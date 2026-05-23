@@ -106,6 +106,13 @@ func main() {
 	// Authentication API endpoints (Public)
 	mux.HandleFunc("/api/admin/login", handleAdminLogin)
 
+	// Public endpoint — no auth required (for client connectivity test)
+	mux.HandleFunc("/api/ping", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(fmt.Sprintf(`{"status":"ok","server":"soroush-relay","version":"3.0","timestamp":"%s"}`, time.Now().UTC().Format(time.RFC3339))))
+	})
+
 	// Protected Admin endpoints
 	mux.HandleFunc("/api/admin/me", JWTMiddleware(handleAdminMe))
 	mux.HandleFunc("/api/stats", JWTMiddleware(handleStats))
