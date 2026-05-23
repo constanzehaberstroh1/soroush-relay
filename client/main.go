@@ -8,20 +8,14 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 )
 
 //go:embed dist
 var embedFS embed.FS
-
-type Account struct {
-	ID          string `json:"id"`
-	PhoneNumber string `json:"phoneNumber"`
-	Name        string `json:"name"`
-	Status      string `json:"status"`
-	LastActive  string `json:"lastActive"`
-}
 
 type TunnelStatus struct {
 	Active     bool      `json:"active"`
@@ -36,58 +30,112 @@ type ServerState struct {
 	tunnelActive bool
 	connecting   bool
 	startedAt    time.Time
-	accounts     []Account
 	socksPort    int
 }
 
 var state = &ServerState{
 	socksPort: 4046,
-	accounts: []Account{
-		{ID: "acc-1", PhoneNumber: "+989123456789", Name: "Sorush Primary", Status: "connected", LastActive: "Just now"},
-		{ID: "acc-2", PhoneNumber: "+989987654321", Name: "Backup Node", Status: "idle", LastActive: "2 hours ago"},
-	},
+}
+
+// Global logs slice shared across files
+var (
+	logsMu     sync.Mutex
+	globalLogs = []map[string]string{
+		{"timestamp": time.Now().Format("15:04:05"), "type": "info", "message": "Soroush WebRTC engine initialized."},
+		{"timestamp": time.Now().Format("15:04:05"), "type": "success", "message": "Ready to establish P2P voice call channel wrapper"},
+	}
+)
+
+func addLog(message string, typeStr string) {
+	logsMu.Lock()
+	defer logsMu.Unlock()
+	globalLogs = append([]map[string]string{
+		{"timestamp": time.Now().Format("15:04:05"), "type": typeStr, "message": message},
+	}, globalLogs...)
+	if len(globalLogs) > 100 {
+		globalLogs = globalLogs[:100]
+	}
 }
 
 func main() {
-	port := flag.Int("port", 8080, "Port to launch the client admin panel")
+	defaultPort := 8080
+	if envPort := os.Getenv("PORT"); envPort != "" {
+		if p, err := strconv.Atoi(envPort); err == nil {
+			defaultPort = p
+		}
+	}
+
+	port := flag.Int("port", defaultPort, "Port to launch the client admin panel")
 	flag.Parse()
 
+	// 1. Initialize SQLite Database
+	initDB()
+
 	// Get embedded assets filesystem
-	distFS, err := fs.Sub(embedFS, "dist")
-	if err != nil {
-		log.Fatalf("Failed to sub embed FS: %v", err)
+	var distFS fs.FS
+	if _, err := embedFS.ReadDir("dist"); err == nil {
+		subFS, err := fs.Sub(embedFS, "dist")
+		if err != nil {
+			log.Fatalf("Failed to sub embed FS: %v", err)
+		}
+		distFS = subFS
+	} else {
+		// Fallback to local disk if embedded assets are not compiled yet during local dev
+		distFS = os.DirFS("dist")
 	}
 
 	mux := http.NewServeMux()
 
-	// API endpoints
-	mux.HandleFunc("/api/status", handleStatus)
-	mux.HandleFunc("/api/start", handleStart)
-	mux.HandleFunc("/api/stop", handleStop)
-	mux.HandleFunc("/api/accounts", handleAccounts)
+	// Authentication API endpoints (Public)
+	mux.HandleFunc("/api/admin/login", handleAdminLogin)
+
+	// Protected Admin endpoints
+	mux.HandleFunc("/api/admin/me", JWTMiddleware(handleAdminMe))
+	mux.HandleFunc("/api/status", JWTMiddleware(handleStatus))
+	mux.HandleFunc("/api/start", JWTMiddleware(handleStart))
+	mux.HandleFunc("/api/stop", JWTMiddleware(handleStop))
+	mux.HandleFunc("/api/accounts", JWTMiddleware(handleAccounts))
+	mux.HandleFunc("/api/accounts/request-otp", JWTMiddleware(handleRequestOTP))
+	mux.HandleFunc("/api/accounts/verify-otp", JWTMiddleware(handleVerifyOTP))
+	mux.HandleFunc("/api/logs", JWTMiddleware(handleGetLogs))
+
+	// CORS Preflight handler
+	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.Error(w, `{"error":"Not found"}`, http.StatusNotFound)
+	})
 
 	// File Server for React Frontend
 	fileServer := http.FileServer(http.FS(distFS))
-	
+
 	// SPA routing wrapper
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Check if file exists in embed filesystem
+		// If requesting an API, fallback to 404
+		if len(r.URL.Path) >= 5 && r.URL.Path[:5] == "/api/" {
+			return
+		}
+
 		f, err := distFS.Open(r.URL.Path[1:])
 		if err == nil {
 			f.Close()
 			fileServer.ServeHTTP(w, r)
 			return
 		}
-		// If file doesn't exist, fall back to index.html (SPA routing)
 		r.URL.Path = "/"
 		fileServer.ServeHTTP(w, r)
 	})
 
-	addr := fmt.Sprintf("127.0.0.1:%d", *port)
+	addr := fmt.Sprintf("0.0.0.0:%d", *port)
 	fmt.Println("==========================================================")
 	fmt.Printf(" Soroush WebRTC Relay CLIENT Panel launched on http://%s\n", addr)
 	fmt.Println("==========================================================")
-	
+
 	server := &http.Server{
 		Addr:         addr,
 		Handler:      mux,
@@ -99,6 +147,8 @@ func main() {
 		log.Fatalf("Server listen failed: %v", err)
 	}
 }
+
+// Re-defining handlers to support JWT protection and use DB
 
 func handleStatus(w http.ResponseWriter, r *http.Request) {
 	state.mu.RLock()
@@ -122,24 +172,38 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
 	state.mu.Lock()
 	if state.tunnelActive {
 		state.mu.Unlock()
-		http.Error(w, "Tunnel already active", http.StatusBadRequest)
+		http.Error(w, `{"error":"Tunnel already active"}`, http.StatusBadRequest)
 		return
 	}
 	state.connecting = true
 	state.mu.Unlock()
 
+	addLog("Connecting Soroush API WebSocket handshake...", "info")
+
 	// Simulate connection asynchronous delay
 	go func() {
-		time.Sleep(3 * time.Second)
+		time.Sleep(1 * time.Second)
+		addLog("apiws WebSocket established successfully", "success")
+		time.Sleep(1 * time.Second)
+		addLog("Received WebRTC SDP Offer from Soroush Server", "success")
+		time.Sleep(1 * time.Second)
+
 		state.mu.Lock()
 		state.connecting = false
 		state.tunnelActive = true
 		state.startedAt = time.Now()
 		state.mu.Unlock()
-		fmt.Println("[Engine] Soroush WebRTC SCTP Data Channel Tunnel established. Forwarding SOCKS5 on port 4046.")
+
+		addLog("Traffic successfully obfuscated as Soroush voice call payload!", "success")
+		addLog("SOCKS5 Proxy interface listening on port 4046", "success")
 	}()
 
 	w.WriteHeader(http.StatusAccepted)
@@ -147,54 +211,66 @@ func handleStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	state.tunnelActive = false
 	state.connecting = false
-	fmt.Println("[Engine] Soroush WebRTC Tunnel disconnected safely.")
+	addLog("Closing WebRTC data channel...", "info")
+	addLog("Soroush WebRTC Tunnel stopped safely.", "warn")
+
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"message": "Tunnel closed"}`))
 }
 
+// DB-backed Soroush Accounts handler
 func handleAccounts(w http.ResponseWriter, r *http.Request) {
-	state.mu.Lock()
-	defer state.mu.Unlock()
-
 	w.Header().Set("Content-Type", "application/json")
-	if r.Method == http.MethodGet {
-		json.NewEncoder(w).Encode(state.accounts)
-		return
-	}
 
-	if r.Method == http.MethodPost {
-		var newAcc Account
-		if err := json.NewDecoder(r.Body).Decode(&newAcc); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+	if r.Method == http.MethodGet {
+		var accounts []DBSoroushAccount
+		if err := db.Order("created_at desc").Find(&accounts).Error; err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"Database read failure: %s"}`, err.Error()), http.StatusInternalServerError)
 			return
 		}
-		newAcc.ID = fmt.Sprintf("acc-%d", time.Now().UnixNano())
-		newAcc.Status = "idle"
-		newAcc.LastActive = "Just registered"
-		state.accounts = append(state.accounts, newAcc)
-		fmt.Printf("[Engine] Added Soroush credentials for account %s\n", newAcc.PhoneNumber)
-		json.NewEncoder(w).Encode(newAcc)
+		json.NewEncoder(w).Encode(accounts)
 		return
 	}
 
 	if r.Method == http.MethodDelete {
 		id := r.URL.Query().Get("id")
-		for i, acc := range state.accounts {
-			if acc.ID == id {
-				state.accounts = append(state.accounts[:i], state.accounts[i+1:]...)
-				fmt.Printf("[Engine] Removed credentials for account %s\n", acc.PhoneNumber)
-				w.WriteHeader(http.StatusOK)
-				w.Write([]byte(`{"message": "Account removed"}`))
-				return
-			}
+		if id == "" {
+			http.Error(w, `{"error":"Missing account id query parameter"}`, http.StatusBadRequest)
+			return
 		}
-		http.Error(w, "Account not found", http.StatusNotFound)
+
+		var acc DBSoroushAccount
+		if err := db.Where("id = ?", id).First(&acc).Error; err != nil {
+			http.Error(w, `{"error":"Account not found"}`, http.StatusNotFound)
+			return
+		}
+
+		if err := db.Delete(&acc).Error; err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"Database delete failure: %s"}`, err.Error()), http.StatusInternalServerError)
+			return
+		}
+
+		addLog(fmt.Sprintf("Account %s removed from Soroush credential library.", acc.PhoneNumber), "warn")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Account removed successfully"})
 		return
 	}
 
-	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	http.Error(w, `{"error":"Method not allowed"}`, http.StatusMethodNotAllowed)
+}
+
+func handleGetLogs(w http.ResponseWriter, r *http.Request) {
+	logsMu.Lock()
+	defer logsMu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(globalLogs)
 }
