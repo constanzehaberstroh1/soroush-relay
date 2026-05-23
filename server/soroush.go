@@ -452,8 +452,8 @@ func handleFetchGroups(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Wait for response with retries for bad_server_salt / new_session
-	for attempt := 0; attempt < 3; attempt++ {
+	// Wait for response with retries for bad_server_salt / new_session or ignored updates
+	for attempt := 0; attempt < 30; attempt++ {
 		result := <-recvCh
 		if result.err != nil {
 			recordSystemLog(fmt.Sprintf("[Groups] Recv failed: %v", result.err), "error")
@@ -469,6 +469,7 @@ func handleFetchGroups(w http.ResponseWriter, r *http.Request) {
 			innerReader.ReadInt32()
 			newSalt, _ := innerReader.ReadInt64()
 			session.ServerSalt = newSalt
+			recordSystemLog(fmt.Sprintf("[Groups] Bad server salt. Updated salt=%d. Retrying send...", newSalt), "info")
 			go func() {
 				cid, reader, err := session.Recv(ctx)
 				recvCh <- recvResult{cid: cid, reader: reader, err: err}
@@ -482,6 +483,17 @@ func handleFetchGroups(w http.ResponseWriter, r *http.Request) {
 			innerReader.ReadInt64()
 			newSalt, _ := innerReader.ReadInt64()
 			session.ServerSalt = newSalt
+			recordSystemLog(fmt.Sprintf("[Groups] New session (salt=%d). Waiting for RPC result...", newSalt), "info")
+			go func() {
+				cid, reader, err := session.Recv(ctx)
+				recvCh <- recvResult{cid: cid, reader: reader, err: err}
+			}()
+			continue
+		}
+
+		// Check if it's an unsolicited update/ack/pong or similar
+		if innerCID != soroushlib.IDDialogs && innerCID != soroushlib.IDDialogsSlice && innerCID != soroushlib.IDRPCError {
+			recordSystemLog(fmt.Sprintf("[Groups] Ignoring unrelated unsolicited packet (cid=0x%08X), waiting for dialogs response...", innerCID), "info")
 			go func() {
 				cid, reader, err := session.Recv(ctx)
 				recvCh <- recvResult{cid: cid, reader: reader, err: err}
@@ -504,5 +516,5 @@ func handleFetchGroups(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.Error(w, `{"error":"Failed to fetch groups after retries"}`, http.StatusInternalServerError)
+	http.Error(w, `{"error":"Failed to fetch groups: timeout or too many unsolicited updates"}`, http.StatusInternalServerError)
 }
