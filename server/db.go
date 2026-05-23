@@ -27,8 +27,14 @@ type DBSoroushAccount struct {
 	ID            string    `gorm:"primaryKey;size:191" json:"id"`
 	PhoneNumber   string    `gorm:"uniqueIndex;size:191;not null" json:"phoneNumber"`
 	Name          string    `gorm:"not null" json:"name"`
-	SoroushUserID string    `gorm:"not null" json:"soroushUserId"`
-	SessionToken  string    `gorm:"not null" json:"sessionToken"`
+	SoroushUserID int64     `json:"soroushUserId"`
+	AccessHash    int64     `json:"accessHash"`
+	DisplayName   string    `json:"displayName"`
+	AuthKey       []byte    `gorm:"type:blob" json:"-"`
+	AuthKeyID     []byte    `gorm:"type:blob" json:"-"`
+	ServerSalt    []byte    `gorm:"type:blob" json:"-"`
+	SessionData   string    `gorm:"type:text" json:"-"`
+	DcID          int       `json:"dcId"`
 	Status        string    `gorm:"default:'idle'" json:"status"`
 	LastActive    string    `json:"lastActive"`
 	CreatedAt     time.Time `json:"createdAt"`

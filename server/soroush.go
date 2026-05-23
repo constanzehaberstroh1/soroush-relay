@@ -1,26 +1,35 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"soroush-relay/soroushlib"
 )
 
-// Pending OTP requests tracker
-type PendingRequest struct {
-	PhoneNumber string
-	Name        string
-	OTP         string
-	ExpiresAt   time.Time
+// ──────────────────────────────────────────────────────────────────────────────
+// Pending OTP sessions — tracks live MTProto sessions during OTP flow
+// ──────────────────────────────────────────────────────────────────────────────
+
+type PendingOTPSession struct {
+	PhoneNumber   string
+	Name          string
+	Transport     *soroushlib.ObfuscatedTransport
+	Session       *soroushlib.MTProtoSession
+	PhoneCodeHash []byte
+	SessionID     string
+	Cancel        context.CancelFunc
+	ExpiresAt     time.Time
 }
 
 var (
-	pendingMu   sync.Mutex
-	pendingOTPs = make(map[string]PendingRequest)
+	pendingMu       sync.Mutex
+	pendingSessions = make(map[string]*PendingOTPSession)
 )
 
 // Request OTP JSON payloads
@@ -33,16 +42,18 @@ type OTPVerifyRequest struct {
 	PhoneNumber string `json:"phoneNumber"`
 	Name        string `json:"name"`
 	Code        string `json:"code"`
+	SessionID   string `json:"sessionId"`
 }
 
-// Generate an elegant, human-friendly Soroush system log entry in backend and frontend
 func recordSystemLog(message string, logType string) {
-	// Add logs to the shared logs array so the logs screen receives them dynamically
 	addLog(message, logType)
 	fmt.Printf("[%s] %s\n", strings.ToUpper(logType), message)
 }
 
-// Request OTP Handler (/api/accounts/request-otp)
+// ──────────────────────────────────────────────────────────────────────────────
+// Request OTP Handler — Real MTProto authentication
+// ──────────────────────────────────────────────────────────────────────────────
+
 func handleRequestOTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
@@ -63,42 +74,155 @@ func handleRequestOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate a 5-digit verification pin (like real Soroush)
-	rand.Seed(time.Now().UnixNano())
-	code := fmt.Sprintf("%05d", rand.Intn(90000)+10000)
+	recordSystemLog(fmt.Sprintf("[Soroush MTProto] Starting real OTP flow for %s (%s)", soroushlib.MaskPhone(req.PhoneNumber), req.Name), "info")
 
+	// Step 1: Connect transport to Soroush WebSocket
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	transport := soroushlib.NewTransport()
+	if err := transport.Connect(ctx); err != nil {
+		cancel()
+		recordSystemLog(fmt.Sprintf("[Soroush MTProto] Transport connect failed: %v", err), "error")
+		http.Error(w, fmt.Sprintf(`{"error":"Transport connect failed: %s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	recordSystemLog("[Soroush MTProto] WebSocket transport connected to wss://im-server.splus.ir/apiws", "success")
+
+	// Step 2: DH key exchange
+	session := soroushlib.NewSession(transport)
+	if err := session.CreateAuthKey(ctx); err != nil {
+		cancel()
+		transport.Disconnect()
+		recordSystemLog(fmt.Sprintf("[Soroush MTProto] Auth key exchange failed: %v", err), "error")
+		http.Error(w, fmt.Sprintf(`{"error":"Auth key exchange failed: %s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	recordSystemLog(fmt.Sprintf("[Soroush MTProto] Auth key generated (auth_key_id=%d)", session.AuthKeyID), "success")
+	cancel()
+
+	// Step 3: Send auth.sendCode wrapped in initConnection
+	sendCodeBody := soroushlib.BuildSendCodeRequest(req.PhoneNumber, soroushlib.SoroushAppID, soroushlib.SoroushAppHash)
+	wrappedBody := soroushlib.WrapInitConnection(soroushlib.SoroushAppID, sendCodeBody)
+
+	recordSystemLog("[Soroush MTProto] Sending auth.sendCode via MTProto...", "info")
+
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	sendCtx, sendCancel := context.WithTimeout(bgCtx, 30*time.Second)
+
+	// Start background recv loop
+	recvCh := make(chan recvResult, 1)
+	go func() {
+		cid, reader, err := session.Recv(sendCtx)
+		recvCh <- recvResult{cid: cid, reader: reader, err: err}
+	}()
+
+	// Send the request
+	msgID, err := session.Send(sendCtx, wrappedBody, true)
+	if err != nil {
+		sendCancel()
+		bgCancel()
+		transport.Disconnect()
+		recordSystemLog(fmt.Sprintf("[Soroush MTProto] Send failed: %v", err), "error")
+		http.Error(w, fmt.Sprintf(`{"error":"Send failed: %s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	// Wait for response with retry for bad_server_salt
+	var phoneCodeHash []byte
+	for attempt := 0; attempt < 3; attempt++ {
+		result := <-recvCh
+		if result.err != nil {
+			sendCancel()
+			bgCancel()
+			transport.Disconnect()
+			recordSystemLog(fmt.Sprintf("[Soroush MTProto] Recv failed: %v", result.err), "error")
+			http.Error(w, fmt.Sprintf(`{"error":"Recv failed: %s"}`, result.err.Error()), http.StatusInternalServerError)
+			return
+		}
+
+		// Handle container messages
+		innerCID, innerReader := unwrapResponse(result.cid, result.reader, msgID)
+
+		if innerCID == soroushlib.IDBadServerSalt {
+			// Read new salt and retry
+			innerReader.ReadInt64() // bad_msg_id
+			innerReader.ReadInt32() // bad_msg_seqno
+			innerReader.ReadInt32() // error_code
+			newSalt, _ := innerReader.ReadInt64()
+			session.ServerSalt = newSalt
+			recordSystemLog(fmt.Sprintf("[Soroush MTProto] Bad server salt, retrying with new salt=%d", newSalt), "info")
+
+			// Re-send
+			go func() {
+				cid, reader, err := session.Recv(sendCtx)
+				recvCh <- recvResult{cid: cid, reader: reader, err: err}
+			}()
+			msgID, _ = session.Send(sendCtx, wrappedBody, true)
+			continue
+		}
+
+		if innerCID == soroushlib.IDNewSession {
+			// New session: read and get salt, then wait for actual response
+			innerReader.ReadInt64() // first_msg_id
+			innerReader.ReadInt64() // unique_id
+			newSalt, _ := innerReader.ReadInt64()
+			session.ServerSalt = newSalt
+			recordSystemLog(fmt.Sprintf("[Soroush MTProto] New session created (salt=%d), waiting for RPC result...", newSalt), "info")
+
+			go func() {
+				cid, reader, err := session.Recv(sendCtx)
+				recvCh <- recvResult{cid: cid, reader: reader, err: err}
+			}()
+			continue
+		}
+
+		// Parse the sent code response
+		var timeout int32
+		phoneCodeHash, timeout, err = soroushlib.ParseSentCodeResponse(innerCID, innerReader)
+		if err != nil {
+			sendCancel()
+			bgCancel()
+			transport.Disconnect()
+			recordSystemLog(fmt.Sprintf("[Soroush MTProto] Parse sendCode response failed: %v", err), "error")
+			http.Error(w, fmt.Sprintf(`{"error":"sendCode failed: %s"}`, err.Error()), http.StatusInternalServerError)
+			return
+		}
+
+		recordSystemLog(fmt.Sprintf("[Soroush MTProto] OTP sent successfully! hash_len=%d, timeout=%d", len(phoneCodeHash), timeout), "success")
+		recordSystemLog(fmt.Sprintf("[Soroush SMS Gateway] Verification code sent to %s via Soroush", req.PhoneNumber), "success")
+		break
+	}
+
+	sendCancel()
+
+	// Store session for verify step
+	sessionID := fmt.Sprintf("sess-%d", time.Now().UnixNano())
 	pendingMu.Lock()
-	pendingOTPs[req.PhoneNumber] = PendingRequest{
-		PhoneNumber: req.PhoneNumber,
-		Name:        req.Name,
-		OTP:         code,
-		ExpiresAt:   time.Now().Add(5 * time.Minute),
+	pendingSessions[sessionID] = &PendingOTPSession{
+		PhoneNumber:   req.PhoneNumber,
+		Name:          req.Name,
+		Transport:     transport,
+		Session:       session,
+		PhoneCodeHash: phoneCodeHash,
+		SessionID:     sessionID,
+		Cancel:        bgCancel,
+		ExpiresAt:     time.Now().Add(5 * time.Minute),
 	}
 	pendingMu.Unlock()
-
-	// 1. Simulate splus.ir handshake
-	recordSystemLog(fmt.Sprintf("Soroush Web Client pre-auth handshake started to https://splus.ir/_websync_?authed=0&version=3.8.1"), "info")
-	time.Sleep(150 * time.Millisecond)
-
-	// 2. Emulate WS connection and handshake trace
-	recordSystemLog(fmt.Sprintf("WebSocket dialing to signaling gateway wss://im-server.splus.ir/apiws..."), "info")
-	time.Sleep(200 * time.Millisecond)
-	recordSystemLog(fmt.Sprintf("Signaling tunnel opened on wss://im-server.splus.ir/apiws with encrypted payload protocol v3"), "success")
-
-	// 3. Emulate OTP delivery and log it inside the console so user can copy it!
-	recordSystemLog(fmt.Sprintf("[Soroush API] Requested SMS PIN for %s (%s)", req.PhoneNumber, req.Name), "info")
-	recordSystemLog(fmt.Sprintf("[Soroush SMS Gateway] Verification PIN sent to %s. PIN: %s (expires in 5m)", req.PhoneNumber, code), "success")
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":     true,
 		"phoneNumber": req.PhoneNumber,
-		"message":     "OTP requested successfully. Please check the Signaling Logs to retrieve your PIN code!",
+		"sessionId":   sessionID,
+		"message":     "OTP sent via Soroush. Enter the verification code you received.",
 	})
 }
 
-// Verify OTP and save account (/api/accounts/verify-otp)
+// ──────────────────────────────────────────────────────────────────────────────
+// Verify OTP Handler — Real MTProto sign-in
+// ──────────────────────────────────────────────────────────────────────────────
+
 func handleVerifyOTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
@@ -114,56 +238,164 @@ func handleVerifyOTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req OTPVerifyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PhoneNumber == "" || req.Code == "" {
-		http.Error(w, `{"error":"Invalid request payload"}`, http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PhoneNumber == "" || req.Code == "" || req.SessionID == "" {
+		http.Error(w, `{"error":"Invalid request payload (phoneNumber, code, sessionId required)"}`, http.StatusBadRequest)
 		return
 	}
 
 	pendingMu.Lock()
-	pending, found := pendingOTPs[req.PhoneNumber]
+	pending, found := pendingSessions[req.SessionID]
+	if found {
+		delete(pendingSessions, req.SessionID)
+	}
 	pendingMu.Unlock()
 
-	// Check OTP
-	if !found || (pending.OTP != req.Code && req.Code != "13651" && req.Code != "136517") {
-		http.Error(w, `{"error":"Invalid or expired verification code"}`, http.StatusUnauthorized)
-		recordSystemLog(fmt.Sprintf("[Soroush Auth Error] Failed verification attempt for phone number %s (code mismatch)", req.PhoneNumber), "error")
+	if !found {
+		http.Error(w, `{"error":"Session not found or expired. Please request a new OTP."}`, http.StatusUnauthorized)
 		return
 	}
 
-	// Delete from pending once verified
-	pendingMu.Lock()
-	delete(pendingOTPs, req.PhoneNumber)
-	pendingMu.Unlock()
+	recordSystemLog(fmt.Sprintf("[Soroush MTProto] Verifying OTP for %s (session %s)", soroushlib.MaskPhone(req.PhoneNumber), req.SessionID[:12]), "info")
 
-	// Generate simulated Soroush Profile details
-	rand.Seed(time.Now().UnixNano())
-	suserID := fmt.Sprintf("splus_usr_%d", rand.Intn(9000000)+1000000)
-	sessionToken := fmt.Sprintf("splus_sess_%016x", rand.Int63())
+	// Build auth.signIn request
+	signInBody := soroushlib.BuildSignInRequest(req.PhoneNumber, pending.PhoneCodeHash, req.Code)
 
-	// Save to DB
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Start recv loop
+	recvCh := make(chan recvResult, 1)
+	go func() {
+		cid, reader, err := pending.Session.Recv(ctx)
+		recvCh <- recvResult{cid: cid, reader: reader, err: err}
+	}()
+
+	msgID, err := pending.Session.Send(ctx, signInBody, true)
+	if err != nil {
+		pending.Cancel()
+		pending.Transport.Disconnect()
+		recordSystemLog(fmt.Sprintf("[Soroush MTProto] signIn send failed: %v", err), "error")
+		http.Error(w, fmt.Sprintf(`{"error":"signIn failed: %s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	// Wait for response
+	result := <-recvCh
+	if result.err != nil {
+		pending.Cancel()
+		pending.Transport.Disconnect()
+		recordSystemLog(fmt.Sprintf("[Soroush MTProto] signIn recv failed: %v", result.err), "error")
+		http.Error(w, fmt.Sprintf(`{"error":"signIn recv failed: %s"}`, result.err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	innerCID, innerReader := unwrapResponse(result.cid, result.reader, msgID)
+
+	// Parse authorization response
+	userID, firstName, lastName, accessHash, err := soroushlib.ParseAuthorizationResponse(innerCID, innerReader)
+	if err != nil {
+		pending.Cancel()
+		pending.Transport.Disconnect()
+		recordSystemLog(fmt.Sprintf("[Soroush MTProto] Auth failed: %v", err), "error")
+		http.Error(w, fmt.Sprintf(`{"error":"Authentication failed: %s"}`, err.Error()), http.StatusUnauthorized)
+		return
+	}
+
+	displayName := strings.TrimSpace(firstName + " " + lastName)
+	recordSystemLog(fmt.Sprintf("[Soroush MTProto] Account verified! User: %s (ID: %d)", displayName, userID), "success")
+
+	// Save to DB with real data
 	newAcc := DBSoroushAccount{
 		ID:            fmt.Sprintf("acc-%d", time.Now().UnixNano()),
 		PhoneNumber:   req.PhoneNumber,
 		Name:          req.Name,
-		SoroushUserID: suserID,
-		SessionToken:  sessionToken,
-		Status:        "idle",
-		LastActive:    "Just registered",
+		SoroushUserID: userID,
+		AccessHash:    accessHash,
+		DisplayName:   displayName,
+		AuthKey:       pending.Session.AuthKey,
+		AuthKeyID:     soroushlib.Int64ToBytes(pending.Session.AuthKeyID),
+		ServerSalt:    soroushlib.Int64ToBytes(pending.Session.ServerSalt),
+		SessionData:   fmt.Sprintf(`{"auth_key_id":%d,"dc_id":2}`, pending.Session.AuthKeyID),
+		DcID:          2,
+		Status:        "connected",
+		LastActive:    "Just authenticated",
 		CreatedAt:     time.Now(),
 	}
 
-	// Insert or replace in DB
 	if err := db.Save(&newAcc).Error; err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"Database write failure: %s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
 
-	// WebSocket established authed=1
-	recordSystemLog(fmt.Sprintf("Negotiating authenticated Websync sequence to Soroush splus.ir/_websync_?authed=1&version=3.8.1"), "info")
-	time.Sleep(150 * time.Millisecond)
-	recordSystemLog(fmt.Sprintf("[Soroush Account Pool] Session activated. Phone: %s | UserID: %s | Token: %s", newAcc.PhoneNumber, newAcc.SoroushUserID, newAcc.SessionToken[:15]+"..."), "success")
+	recordSystemLog(fmt.Sprintf("[Soroush Account Pool] Session activated. Phone: %s | UserID: %d | Name: %s", newAcc.PhoneNumber, newAcc.SoroushUserID, newAcc.DisplayName), "success")
+
+	// Clean up the MTProto session (we've saved the auth key for later use)
+	pending.Cancel()
+	pending.Transport.Disconnect()
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(newAcc)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"id":            newAcc.ID,
+		"phoneNumber":   newAcc.PhoneNumber,
+		"name":          newAcc.Name,
+		"soroushUserId": newAcc.SoroushUserID,
+		"displayName":   newAcc.DisplayName,
+		"status":        newAcc.Status,
+		"lastActive":    newAcc.LastActive,
+		"createdAt":     newAcc.CreatedAt,
+	})
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Helpers for response unwrapping
+// ──────────────────────────────────────────────────────────────────────────────
+
+type recvResult struct {
+	cid    uint32
+	reader *soroushlib.TLReader
+	err    error
+}
+
+// unwrapResponse handles rpc_result and msg_container wrapping to get the inner response
+func unwrapResponse(cid uint32, r *soroushlib.TLReader, expectedMsgID int64) (uint32, *soroushlib.TLReader) {
+	switch cid {
+	case soroushlib.IDRPCResult:
+		r.ReadInt64()           // req_msg_id
+		innerCID, _ := r.ReadUint32()
+		// Create sub-reader from remaining data
+		rem := r.Remaining()
+		data, _ := r.ReadRaw(rem)
+		return innerCID, soroushlib.NewTLReader(data)
+
+	case soroushlib.IDMsgContainer:
+		// Parse container, find the rpc_result
+		count, _ := r.ReadInt32()
+		for i := int32(0); i < count; i++ {
+			r.ReadInt64() // msg_id
+			r.ReadInt32() // seq_no
+			bodyLen, _ := r.ReadInt32()
+			body, err := r.ReadRaw(int(bodyLen))
+			if err != nil {
+				continue
+			}
+			subReader := soroushlib.NewTLReader(body)
+			subCID, _ := subReader.ReadUint32()
+			if subCID == soroushlib.IDRPCResult {
+				subReader.ReadInt64() // req_msg_id
+				innerCID, _ := subReader.ReadUint32()
+				rem := subReader.Remaining()
+				data, _ := subReader.ReadRaw(rem)
+				return innerCID, soroushlib.NewTLReader(data)
+			}
+			// Return any other interesting CID
+			if subCID == soroushlib.IDBadServerSalt || subCID == soroushlib.IDNewSession {
+				return subCID, subReader
+			}
+		}
+		return cid, r
+
+	default:
+		return cid, r
+	}
 }

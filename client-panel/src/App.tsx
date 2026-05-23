@@ -74,8 +74,10 @@ interface Account {
   id: string;
   phoneNumber: string;
   name: string;
-  soroushUserId: string;
-  sessionToken: string;
+  soroushUserId: number;
+  displayName: string;
+  accessHash: number;
+  dcId: number;
   status: 'connected' | 'error' | 'idle';
   lastActive: string;
   createdAt: string;
@@ -450,6 +452,7 @@ function AccountsView() {
   const [newPhone, setNewPhone] = useState<string>('');
   const [newName, setNewName] = useState<string>('');
   const [verifyCode, setVerifyCode] = useState<string>('');
+  const [otpSessionId, setOtpSessionId] = useState<string>('');
   const [step, setStep] = useState<1 | 2>(1);
   const [loading, setLoading] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string>('');
@@ -486,8 +489,9 @@ function AccountsView() {
       });
       const data = await res.json();
       if (res.ok) {
+        setOtpSessionId(data.sessionId || '');
         setStep(2);
-        setHelperNotice('OTP request successfully initiated! Check the system logs terminal or the "Logs Console" tab on the client dashboard to capture your PIN code.');
+        setHelperNotice('OTP sent via Soroush! Enter the verification code you received on your phone.');
       } else {
         setErrorMsg(data.error || 'Failed to dispatch verification SMS.');
       }
@@ -509,7 +513,7 @@ function AccountsView() {
       const res = await fetch(`${API_BASE}/accounts/verify-otp`, {
         method: 'POST',
         headers: getHeaders(),
-        body: JSON.stringify({ phoneNumber: newPhone, name: newName, code: verifyCode }),
+        body: JSON.stringify({ phoneNumber: newPhone, name: newName, code: verifyCode, sessionId: otpSessionId }),
       });
       const data = await res.json();
       if (res.ok) {
@@ -517,6 +521,7 @@ function AccountsView() {
         setNewPhone('');
         setNewName('');
         setVerifyCode('');
+        setOtpSessionId('');
         setStep(1);
         setHelperNotice('');
         fetchAccounts();
@@ -570,7 +575,7 @@ function AccountsView() {
                   <TableCell style={{ fontWeight: 700 }}>Account Name</TableCell>
                   <TableCell style={{ fontWeight: 700 }}>Phone Number</TableCell>
                   <TableCell style={{ fontWeight: 700 }}>Soroush ID</TableCell>
-                  <TableCell style={{ fontWeight: 700 }}>Session Token</TableCell>
+                  <TableCell style={{ fontWeight: 700 }}>Display Name</TableCell>
                   <TableCell style={{ fontWeight: 700 }}>Status</TableCell>
                   <TableCell style={{ fontWeight: 700 }}>Registered</TableCell>
                   <TableCell style={{ fontWeight: 700 }} align="center">Action</TableCell>
@@ -592,8 +597,8 @@ function AccountsView() {
                     </TableCell>
                     <TableCell style={{ fontFamily: 'monospace' }}>{acc.phoneNumber}</TableCell>
                     <TableCell style={{ fontFamily: 'monospace' }}>{acc.soroushUserId}</TableCell>
-                    <TableCell style={{ fontFamily: 'monospace' }}>
-                      {acc.sessionToken ? `${acc.sessionToken.substring(0, 14)}...` : 'N/A'}
+                    <TableCell>
+                      {acc.displayName || acc.name}
                     </TableCell>
                     <TableCell>
                       <Badge

@@ -16,8 +16,12 @@ RUN bun run build
 FROM golang:1.26.2-alpine AS backend-builder
 WORKDIR /app
 
-# Copy dependency manifest
-COPY go.mod ./
+# Copy dependency manifests and download modules
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy the shared soroushlib package (used by server)
+COPY soroushlib/ ./soroushlib/
 
 # Copy the compiled frontend assets from Stage 1 into server/dist
 COPY --from=frontend-builder /app/server/dist/ ./server/dist/
