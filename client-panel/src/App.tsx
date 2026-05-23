@@ -26,6 +26,10 @@ import {
   Avatar,
   CircularProgress,
   Alert,
+  Stepper,
+  Step,
+  StepLabel,
+  Chip,
 } from '@mui/material';
 import {
   Brightness4 as DarkModeIcon,
@@ -43,6 +47,8 @@ import {
   Settings as SettingsIcon,
   LockOutlined as LockIcon,
   Refresh as RefreshIcon,
+  Groups as GroupIcon,
+  Science as ScienceIcon,
 } from '@mui/icons-material';
 import { lightTheme, darkTheme } from './theme';
 import {
@@ -714,6 +720,32 @@ function SettingsView() {
   const [testResult, setTestResult] = useState<any>(null);
   const [testing, setTesting] = useState(false);
 
+  // Group Bus Config
+  const [groupChatId, setGroupChatId] = useState<string>('');
+  const [groupPsk, setGroupPsk] = useState<string>('');
+  const [groupSaving, setGroupSaving] = useState(false);
+  const [groupSaved, setGroupSaved] = useState(false);
+
+  // Tunnel Test
+  const [tunnelTesting, setTunnelTesting] = useState(false);
+  const [tunnelTestResult, setTunnelTestResult] = useState<any>(null);
+  const [tunnelTestActiveStep, setTunnelTestActiveStep] = useState(-1);
+
+  // Load group config on mount
+  useEffect(() => {
+    const loadGroupConfig = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/tunnel/config`, { headers: getHeaders() });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.groupChatId) setGroupChatId(String(data.groupChatId));
+          if (data.psk) setGroupPsk(data.psk);
+        }
+      } catch { /* ignore */ }
+    };
+    loadGroupConfig();
+  }, []);
+
   const handleSave = () => {
     localStorage.setItem('server-exit-url', serverUrl);
     alert('Settings saved.');
@@ -740,6 +772,60 @@ function SettingsView() {
     } finally {
       setTesting(false);
     }
+  };
+
+  const handleSaveGroupConfig = async () => {
+    setGroupSaving(true);
+    setGroupSaved(false);
+    try {
+      const res = await fetch(`${API_BASE}/tunnel/config`, {
+        method: 'POST',
+        headers: getHeaders(),
+        body: JSON.stringify({
+          groupChatId: Number(groupChatId),
+          psk: groupPsk,
+          dispatcherUserId: 0,
+          dispatcherAccessHash: 0,
+        }),
+      });
+      if (res.ok) setGroupSaved(true);
+    } catch { /* ignore */ }
+    finally { setGroupSaving(false); }
+  };
+
+  const tunnelTestStepNames = ['MTProto Connect', 'Group DISCOVER', 'WebRTC Call', 'Ping / Pong'];
+  const tunnelTestStepKeys = ['mtproto_connect', 'group_discover', 'webrtc_call', 'ping_pong'];
+
+  const handleTunnelTest = async () => {
+    setTunnelTesting(true);
+    setTunnelTestResult(null);
+    setTunnelTestActiveStep(0);
+    try {
+      const res = await fetch(`${API_BASE}/tunnel/test`, {
+        method: 'POST',
+        headers: getHeaders(),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setTunnelTestResult(data);
+        // Find the last completed step
+        const lastIdx = (data.steps || []).findIndex((s: any) => s.status === 'fail' || s.status === 'skip');
+        setTunnelTestActiveStep(lastIdx === -1 ? data.steps.length : lastIdx);
+      } else {
+        setTunnelTestResult({ success: false, steps: [{ name: 'mtproto_connect', status: 'fail', detail: 'Backend error' }] });
+        setTunnelTestActiveStep(0);
+      }
+    } catch {
+      setTunnelTestResult({ success: false, steps: [{ name: 'mtproto_connect', status: 'fail', detail: 'Network error' }] });
+      setTunnelTestActiveStep(0);
+    } finally {
+      setTunnelTesting(false);
+    }
+  };
+
+  const getStepStatus = (stepKey: string) => {
+    if (!tunnelTestResult?.steps) return undefined;
+    return tunnelTestResult.steps.find((s: any) => s.name === stepKey);
   };
 
   return (
@@ -822,6 +908,153 @@ function SettingsView() {
               )}
             </Box>
           )}
+        </CardContent>
+      </Card>
+
+      {/* Group Bus Configuration Card */}
+      <Card>
+        <CardContent>
+          <Box display="flex" alignItems="center" justifyContent="space-between" mb={1}>
+            <Typography variant="h6" fontWeight={700}>
+              Group Bus Configuration
+            </Typography>
+            <GroupIcon color="secondary" />
+          </Box>
+          <Typography variant="body2" color="text.secondary" mb={3}>
+            Configure the "My lovely family" Soroush group as the pub/sub message bus for discovery and signaling.
+          </Typography>
+
+          <Divider sx={{ mb: 3 }} />
+
+          <Grid container spacing={2} alignItems="flex-end">
+            <Grid item xs={12} sm={6}>
+              <TextField
+                label="Group Chat ID"
+                placeholder="e.g. 277900000529092119"
+                value={groupChatId}
+                onChange={(e) => { setGroupChatId(e.target.value); setGroupSaved(false); }}
+                fullWidth
+                size="small"
+                disabled={groupSaving}
+                helperText="The numeric chat_id of your Soroush group"
+              />
+            </Grid>
+            <Grid item xs={12} sm={6}>
+              <TextField
+                label="Pre-Shared Key (PSK)"
+                placeholder="Leave empty for default"
+                value={groupPsk}
+                onChange={(e) => { setGroupPsk(e.target.value); setGroupSaved(false); }}
+                fullWidth
+                size="small"
+                disabled={groupSaving}
+                helperText="AES-256 encryption key for stealth group messages"
+              />
+            </Grid>
+            <Grid item xs={12}>
+              <Button
+                customVariant="primary"
+                onClick={handleSaveGroupConfig}
+                disabled={groupSaving || !groupChatId}
+                startIcon={groupSaving ? <CircularProgress size={18} color="inherit" /> : <StartIcon />}
+              >
+                {groupSaved ? '✅ Saved!' : 'Save Group Config'}
+              </Button>
+            </Grid>
+          </Grid>
+        </CardContent>
+      </Card>
+
+      {/* Soroush Tunnel Test Card */}
+      <Card>
+        <CardContent>
+          <Box display="flex" alignItems="center" justifyContent="space-between" mb={1}>
+            <Typography variant="h6" fontWeight={700}>
+              Soroush Tunnel Test
+            </Typography>
+            <ScienceIcon color="secondary" />
+          </Box>
+          <Typography variant="body2" color="text.secondary" mb={3}>
+            Run a full end-to-end connectivity test: MTProto → Group Discovery → WebRTC Call → Data Channel Ping/Pong.
+          </Typography>
+
+          <Divider sx={{ mb: 3 }} />
+
+          {/* Stepper */}
+          <Stepper activeStep={tunnelTestActiveStep} alternativeLabel sx={{ mb: 3 }}>
+            {tunnelTestStepNames.map((label, index) => {
+              const stepData = getStepStatus(tunnelTestStepKeys[index]);
+              const isError = stepData?.status === 'fail';
+              const isSkip = stepData?.status === 'skip';
+              return (
+                <Step key={label} completed={stepData?.status === 'pass'}>
+                  <StepLabel
+                    error={isError}
+                    optional={isSkip ? <Typography variant="caption" color="text.secondary">skipped</Typography> : undefined}
+                  >
+                    {label}
+                  </StepLabel>
+                </Step>
+              );
+            })}
+          </Stepper>
+
+          {/* Step Results */}
+          {tunnelTestResult?.steps && (
+            <Box display="flex" flexDirection="column" gap={1} mb={3}>
+              {tunnelTestResult.steps.map((step: any, idx: number) => (
+                <Box
+                  key={idx}
+                  display="flex"
+                  alignItems="center"
+                  gap={1.5}
+                  sx={{
+                    p: 1.5,
+                    borderRadius: 2,
+                    bgcolor: step.status === 'pass' ? 'rgba(46,125,50,0.08)' :
+                             step.status === 'fail' ? 'rgba(211,47,47,0.08)' : 'rgba(128,128,128,0.06)',
+                  }}
+                >
+                  <Chip
+                    label={step.status.toUpperCase()}
+                    size="small"
+                    color={step.status === 'pass' ? 'success' : step.status === 'fail' ? 'error' : 'default'}
+                    sx={{ fontWeight: 700, minWidth: 60 }}
+                  />
+                  <Typography variant="body2" fontWeight={600} sx={{ minWidth: 140 }}>
+                    {tunnelTestStepNames[idx]}
+                  </Typography>
+                  <Typography variant="caption" color="text.secondary" sx={{ flex: 1 }}>
+                    {step.detail}
+                  </Typography>
+                  {step.latencyMs > 0 && (
+                    <Chip label={`${step.latencyMs}ms`} size="small" variant="outlined" />
+                  )}
+                </Box>
+              ))}
+            </Box>
+          )}
+
+          {tunnelTestResult && (
+            <Alert
+              severity={tunnelTestResult.success ? 'success' : 'error'}
+              sx={{ borderRadius: 2, mb: 2 }}
+            >
+              {tunnelTestResult.success
+                ? `✅ Tunnel test passed! Total: ${tunnelTestResult.overallLatencyMs}ms`
+                : '❌ Tunnel test failed. Check step details above.'}
+            </Alert>
+          )}
+
+          <Button
+            customVariant="glow"
+            onClick={handleTunnelTest}
+            disabled={tunnelTesting || !groupChatId}
+            fullWidth
+            startIcon={tunnelTesting ? <CircularProgress size={18} color="inherit" /> : <ScienceIcon />}
+          >
+            {tunnelTesting ? 'Running Test...' : '🔬 Test Soroush Tunnel'}
+          </Button>
         </CardContent>
       </Card>
 

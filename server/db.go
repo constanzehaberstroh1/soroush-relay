@@ -41,6 +41,13 @@ type DBSoroushAccount struct {
 	CreatedAt     time.Time `json:"createdAt"`
 }
 
+// DBGroupConfig stores the group bus configuration for the server
+type DBGroupConfig struct {
+	ID          uint   `gorm:"primaryKey" json:"id"`
+	GroupChatID int64  `json:"groupChatId"`  // "My lovely family" group chat ID
+	PSK         string `gorm:"size:191" json:"psk"` // Pre-shared key for stealth encoding
+}
+
 // Initialize MySQL database for server exit node (with fallback configurations)
 func initDB() {
 	var err error
@@ -82,7 +89,7 @@ func initDB() {
 	fmt.Println("[DB] MySQL database connection established successfully.")
 
 	// Auto migrate tables (supports GORM migrations inside MySQL)
-	err = db.AutoMigrate(&DBAdmin{}, &DBSoroushAccount{})
+	err = db.AutoMigrate(&DBAdmin{}, &DBSoroushAccount{}, &DBGroupConfig{})
 	if err != nil {
 		log.Fatalf("[DB] Database migration failed: %v", err)
 	}

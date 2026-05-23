@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"sync"
 	"time"
@@ -25,6 +26,8 @@ type ServerTunnelEngine struct {
 	cancel          context.CancelFunc
 	activeWorkers   map[string]*WorkerConnection // keyed by account ID
 	dispatcherReady bool
+	groupChatID     int64
+	psk             []byte
 }
 
 type WorkerConnection struct {
@@ -52,13 +55,27 @@ func startServerTunnel() error {
 		serverTunnel.mu.Unlock()
 		return fmt.Errorf("server tunnel already running")
 	}
+
+	// Load group config from DB
+	var groupCfg DBGroupConfig
+	if err := db.First(&groupCfg).Error; err != nil || groupCfg.GroupChatID == 0 {
+		serverTunnel.mu.Unlock()
+		return fmt.Errorf("no group config set — configure the 'My lovely family' group chat ID first")
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	serverTunnel.ctx = ctx
 	serverTunnel.cancel = cancel
 	serverTunnel.running = true
+	serverTunnel.groupChatID = groupCfg.GroupChatID
+	if groupCfg.PSK != "" {
+		serverTunnel.psk = []byte(groupCfg.PSK)
+	} else {
+		serverTunnel.psk = soroushlib.DefaultPSK
+	}
 	serverTunnel.mu.Unlock()
 
-	go runDispatcher(ctx)
+	go runGroupObserver(ctx)
 	return nil
 }
 
@@ -87,87 +104,182 @@ func stopServerTunnel() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Dispatcher — listens for SYN_REQ_V1 and assigns workers
+// Group Observer — joins "My lovely family" group, sends heartbeats, handles DISCOVER
 // ──────────────────────────────────────────────────────────────────────────────
 
-func runDispatcher(ctx context.Context) {
+func runGroupObserver(ctx context.Context) {
 	defer func() {
 		if r := recover(); r != nil {
-			recordSystemLog(fmt.Sprintf("[Dispatcher] Panic: %v", r), "error")
+			recordSystemLog(fmt.Sprintf("[GroupObserver] Panic: %v", r), "error")
 		}
 	}()
 
-	// Find the dispatcher account (role = "dispatcher")
-	var dispatcherAcc DBSoroushAccount
-	if err := db.Where("role = ?", "dispatcher").First(&dispatcherAcc).Error; err != nil {
-		recordSystemLog("[Dispatcher] No dispatcher account configured. Set an account role to 'dispatcher'.", "error")
+	// Find the first connected account for group messaging
+	var account DBSoroushAccount
+	if err := db.Where("status = ? AND length(auth_key) > 0", "connected").First(&account).Error; err != nil {
+		recordSystemLog("[GroupObserver] No connected account available for group messaging.", "error")
 		return
 	}
 
-	recordSystemLog(fmt.Sprintf("[Dispatcher] Starting with account: %s (ID: %d)", dispatcherAcc.PhoneNumber, dispatcherAcc.SoroushUserID), "info")
+	recordSystemLog(fmt.Sprintf("[GroupObserver] Starting with account: %s (ID: %d)", account.PhoneNumber, account.SoroushUserID), "info")
 
-	// Connect dispatcher to Soroush
-	session, transport := soroushlib.RestoreSession(dispatcherAcc.AuthKey, dispatcherAcc.AuthKeyID, dispatcherAcc.ServerSalt)
+	// Connect to Soroush
+	session, transport := soroushlib.RestoreSession(account.AuthKey, account.AuthKeyID, account.ServerSalt)
 
 	connCtx, connCancel := context.WithTimeout(ctx, 15*time.Second)
 	if err := transport.Connect(connCtx); err != nil {
 		connCancel()
-		recordSystemLog(fmt.Sprintf("[Dispatcher] Transport connect failed: %v", err), "error")
+		recordSystemLog(fmt.Sprintf("[GroupObserver] Transport connect failed: %v", err), "error")
 		return
 	}
 	connCancel()
+	defer transport.Disconnect()
 
-	recordSystemLog("[Dispatcher] Connected to Soroush. Listening for dispatch requests...", "success")
+	recordSystemLog("[GroupObserver] Connected to Soroush. Monitoring group...", "success")
 
 	serverTunnel.mu.Lock()
 	serverTunnel.dispatcherReady = true
 	serverTunnel.mu.Unlock()
 
-	// Listen for incoming messages
-	err := soroushlib.ListenForMessages(ctx, session, func(msg soroushlib.IncomingMessage) {
+	chatID := serverTunnel.groupChatID
+	psk := serverTunnel.psk
+	serverID := account.ID
+
+	// Send initial heartbeat
+	hb := soroushlib.NewHeartbeat(serverID, account.SoroushUserID, account.AccessHash, 0)
+	if err := soroushlib.SendGroupCommand(ctx, session, chatID, hb, psk); err != nil {
+		recordSystemLog(fmt.Sprintf("[GroupObserver] Initial heartbeat failed: %v", err), "warn")
+	}
+
+	// Track pending DISCOVERs we've already replied to
+	repliedDiscovers := make(map[string]time.Time)
+
+	// Start heartbeat ticker (every 5 minutes)
+	heartbeatTicker := time.NewTicker(5 * time.Minute)
+	defer heartbeatTicker.Stop()
+
+	// Listen for group messages
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- soroushlib.ListenForMessages(ctx, session, func(msg soroushlib.IncomingMessage) {
+			// Only process group messages for our group
+			if !msg.IsGroup || msg.ChatID != chatID {
+				return
+			}
+
+			// Ignore our own messages
+			if msg.FromUserID == account.SoroushUserID {
+				return
+			}
+
+			// Try to decode as a group command
+			cmd, err := soroushlib.DecodeGroupCommand(msg.Text, psk)
+			if err != nil {
+				// Not a stealth command, just a normal chat message — ignore
+				return
+			}
+
+			recordSystemLog(fmt.Sprintf("[GroupObserver] Received %s from UID=%d", cmd.Cmd, msg.FromUserID), "info")
+
+			switch cmd.Cmd {
+			case soroushlib.CmdDiscover:
+				// Check if we already replied to this DISCOVER
+				if _, ok := repliedDiscovers[cmd.CID]; ok {
+					return
+				}
+
+				// Random delay to prevent race conditions (0-500ms)
+				delay := time.Duration(rand.Intn(500)) * time.Millisecond
+				time.Sleep(delay)
+
+				// Send OFFER
+				offer := soroushlib.NewOffer(cmd.CID, serverID, account.SoroushUserID, account.AccessHash)
+				offerCtx, offerCancel := context.WithTimeout(ctx, 10*time.Second)
+				if err := soroushlib.SendGroupCommand(offerCtx, session, chatID, offer, psk); err != nil {
+					recordSystemLog(fmt.Sprintf("[GroupObserver] Failed to send OFFER: %v", err), "error")
+				} else {
+					recordSystemLog(fmt.Sprintf("[GroupObserver] Sent OFFER to client %s", cmd.CID), "success")
+					repliedDiscovers[cmd.CID] = time.Now()
+				}
+				offerCancel()
+
+			case soroushlib.CmdCalling:
+				// Client is calling us — prepare for incoming WebRTC call
+				if cmd.SID == serverID {
+					recordSystemLog(fmt.Sprintf("[GroupObserver] Client %s is CALLING us! Preparing worker...", cmd.CID), "success")
+					go startWorkerListener(ctx, &account, msg.FromUserID)
+				}
+
+			case soroushlib.CmdDisconnect:
+				recordSystemLog(fmt.Sprintf("[GroupObserver] Received DISCONNECT from %s", cmd.SID), "info")
+			}
+		})
+	}()
+
+	// Main loop: send heartbeats + wait
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-heartbeatTicker.C:
+			hb := soroushlib.NewHeartbeat(serverID, account.SoroushUserID, account.AccessHash, len(serverTunnel.activeWorkers))
+			hbCtx, hbCancel := context.WithTimeout(ctx, 10*time.Second)
+			soroushlib.SendGroupCommand(hbCtx, session, chatID, hb, psk)
+			hbCancel()
+		case err := <-errCh:
+			if err != nil && ctx.Err() == nil {
+				recordSystemLog(fmt.Sprintf("[GroupObserver] Listen error: %v", err), "error")
+			}
+			return
+		}
+	}
+}
+
+// runDispatcher is the legacy dispatcher (kept for backward compatibility)
+func runDispatcher(ctx context.Context) {
+	recordSystemLog("[Dispatcher] Legacy dispatcher mode. Use Group Bus for new deployments.", "warn")
+	// Find the dispatcher account (role = "dispatcher")
+	var dispatcherAcc DBSoroushAccount
+	if err := db.Where("role = ?", "dispatcher").First(&dispatcherAcc).Error; err != nil {
+		recordSystemLog("[Dispatcher] No dispatcher account configured.", "error")
+		return
+	}
+
+	session, transport := soroushlib.RestoreSession(dispatcherAcc.AuthKey, dispatcherAcc.AuthKeyID, dispatcherAcc.ServerSalt)
+	connCtx, connCancel := context.WithTimeout(ctx, 15*time.Second)
+	if err := transport.Connect(connCtx); err != nil {
+		connCancel()
+		return
+	}
+	connCancel()
+	defer transport.Disconnect()
+
+	serverTunnel.mu.Lock()
+	serverTunnel.dispatcherReady = true
+	serverTunnel.mu.Unlock()
+
+	soroushlib.ListenForMessages(ctx, session, func(msg soroushlib.IncomingMessage) {
 		if msg.Text == soroushlib.DispatcherSynRequest {
-			recordSystemLog(fmt.Sprintf("[Dispatcher] SYN_REQ_V1 from UserID=%d", msg.FromUserID), "info")
 			handleDispatchRequest(ctx, session, msg.FromUserID, &dispatcherAcc)
 		}
 	})
-
-	if err != nil && ctx.Err() == nil {
-		recordSystemLog(fmt.Sprintf("[Dispatcher] Listen error: %v", err), "error")
-	}
 
 	transport.Disconnect()
 }
 
 func handleDispatchRequest(ctx context.Context, session *soroushlib.MTProtoSession, clientUserID int64, dispatcherAcc *DBSoroushAccount) {
-	// Find an idle worker account
 	var workerAcc DBSoroushAccount
 	if err := db.Where("role = ? AND status = ?", "worker", "connected").First(&workerAcc).Error; err != nil {
-		recordSystemLog("[Dispatcher] No idle workers available!", "error")
-		// Reply with NACK
 		sendCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		soroushlib.SendTextMessage(sendCtx, session, clientUserID, 0, soroushlib.DispatcherNoWorkers)
 		cancel()
 		return
 	}
-
-	// Mark worker as busy
 	db.Model(&workerAcc).Update("status", "busy")
-
-	// Reply with ACK_ROUTE
 	response := soroushlib.FormatDispatcherResponse(workerAcc.SoroushUserID, workerAcc.AccessHash)
 	sendCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	err := soroushlib.SendTextMessage(sendCtx, session, clientUserID, 0, response)
+	soroushlib.SendTextMessage(sendCtx, session, clientUserID, 0, response)
 	cancel()
-
-	if err != nil {
-		recordSystemLog(fmt.Sprintf("[Dispatcher] Failed to send ACK_ROUTE: %v", err), "error")
-		db.Model(&workerAcc).Update("status", "connected")
-		return
-	}
-
-	recordSystemLog(fmt.Sprintf("[Dispatcher] Assigned worker %s (ID: %d) to client UserID=%d", workerAcc.PhoneNumber, workerAcc.SoroushUserID, clientUserID), "success")
-
-	// Start worker listener for incoming calls
 	go startWorkerListener(ctx, &workerAcc, clientUserID)
 }
 
@@ -357,9 +469,102 @@ func handleIncomingCall(ctx context.Context, session *soroushlib.MTProtoSession,
 		return fmt.Errorf("send phone.acceptCall: %w", err)
 	}
 
-	recordSystemLog(fmt.Sprintf("[Worker %s] Call accepted. WebRTC negotiating...", account.PhoneNumber), "info")
+	recordSystemLog(fmt.Sprintf("[Worker %s] Call accepted. Waiting for SDP offer...", account.PhoneNumber), "info")
 
-	// Keep the worker alive
+	// ── SDP Exchange: Listen for SDP_OFFER from client via direct message ──
+	sdpCtx, sdpCancel := context.WithTimeout(ctx, 45*time.Second)
+	defer sdpCancel()
+
+	// Collect ICE candidates to send after SDP answer
+	pendingICE := make(chan string, 32)
+	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+		if c == nil {
+			return
+		}
+		candidateJSON := c.ToJSON().Candidate
+		select {
+		case pendingICE <- candidateJSON:
+		default:
+		}
+	})
+
+	// Listen for SDP offer + ICE candidates from client
+	sdpDone := make(chan bool, 1)
+	go func() {
+		soroushlib.ListenForMessages(sdpCtx, session, func(msg soroushlib.IncomingMessage) {
+			if msg.IsGroup || msg.FromUserID != callEvent.AdminID {
+				return
+			}
+
+			if soroushlib.IsSDPOffer(msg.Text) {
+				sdpStr := soroushlib.ExtractSDP(msg.Text)
+				recordSystemLog(fmt.Sprintf("[Worker %s] Received SDP offer (%d bytes)", account.PhoneNumber, len(sdpStr)), "info")
+
+				offer := webrtc.SessionDescription{
+					Type: webrtc.SDPTypeOffer,
+					SDP:  sdpStr,
+				}
+				if err := pc.SetRemoteDescription(offer); err != nil {
+					recordSystemLog(fmt.Sprintf("[Worker %s] SetRemoteDescription failed: %v", account.PhoneNumber, err), "error")
+					return
+				}
+
+				answer, err := pc.CreateAnswer(nil)
+				if err != nil {
+					recordSystemLog(fmt.Sprintf("[Worker %s] CreateAnswer failed: %v", account.PhoneNumber, err), "error")
+					return
+				}
+				if err := pc.SetLocalDescription(answer); err != nil {
+					recordSystemLog(fmt.Sprintf("[Worker %s] SetLocalDescription failed: %v", account.PhoneNumber, err), "error")
+					return
+				}
+
+				// Send SDP answer back via direct message
+				answerMsg := soroushlib.FormatSDPAnswer(answer.SDP)
+				sendCtx, sendCancel := context.WithTimeout(sdpCtx, 10*time.Second)
+				soroushlib.SendTextMessage(sendCtx, session, callEvent.AdminID, 0, answerMsg)
+				sendCancel()
+				recordSystemLog(fmt.Sprintf("[Worker %s] SDP answer sent (%d bytes)", account.PhoneNumber, len(answer.SDP)), "success")
+
+				// Send buffered ICE candidates
+				go func() {
+					time.Sleep(500 * time.Millisecond)
+					for {
+						select {
+						case candidate := <-pendingICE:
+							iceMsg := soroushlib.FormatICECandidate(candidate)
+							iceCtx, iceCancel := context.WithTimeout(sdpCtx, 5*time.Second)
+							soroushlib.SendTextMessage(iceCtx, session, callEvent.AdminID, 0, iceMsg)
+							iceCancel()
+						case <-sdpCtx.Done():
+							return
+						case <-time.After(3 * time.Second):
+							return
+						}
+					}
+				}()
+
+				sdpDone <- true
+			}
+
+			if soroushlib.IsICECandidate(msg.Text) {
+				candidateStr := soroushlib.ExtractICECandidate(msg.Text)
+				if err := pc.AddICECandidate(webrtc.ICECandidateInit{Candidate: candidateStr}); err != nil {
+					recordSystemLog(fmt.Sprintf("[Worker %s] AddICECandidate failed: %v", account.PhoneNumber, err), "warn")
+				}
+			}
+		})
+	}()
+
+	select {
+	case <-sdpDone:
+		recordSystemLog(fmt.Sprintf("[Worker %s] SDP negotiation complete!", account.PhoneNumber), "success")
+	case <-sdpCtx.Done():
+		pc.Close()
+		return fmt.Errorf("SDP exchange timed out")
+	}
+
+	// Keep the worker alive until context is cancelled
 	<-ctx.Done()
 	pc.Close()
 	return nil
@@ -404,6 +609,13 @@ func handleWorkerMessage(dc *webrtc.DataChannel, msg webrtc.DataChannelMessage, 
 		pong := PulseMessage{Type: "pong", Timestamp: pulse.Timestamp}
 		data, _ := json.Marshal(pong)
 		dc.Send(data)
+
+	case "PING":
+		// Canonical test protocol: echo back the timestamp
+		pong := PulseMessage{Type: "PONG", Timestamp: pulse.Timestamp}
+		data, _ := json.Marshal(pong)
+		dc.Send(data)
+		recordSystemLog(fmt.Sprintf("[Worker %s] PING received, PONG sent (ts=%d)", account.PhoneNumber, pulse.Timestamp), "info")
 	}
 }
 
@@ -492,4 +704,46 @@ func handleSetAccountRole(w http.ResponseWriter, r *http.Request) {
 	addLog(fmt.Sprintf("Account %s role set to '%s'", req.AccountID, req.Role), "success")
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"message": "Role updated"})
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Group Config API — GET/POST /api/group/config
+// ──────────────────────────────────────────────────────────────────────────────
+
+func handleGroupConfig(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	switch r.Method {
+	case http.MethodGet:
+		var cfg DBGroupConfig
+		db.First(&cfg)
+		json.NewEncoder(w).Encode(cfg)
+
+	case http.MethodPost:
+		var req struct {
+			GroupChatID int64  `json:"groupChatId"`
+			PSK        string `json:"psk"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error":"Invalid request"}`, http.StatusBadRequest)
+			return
+		}
+
+		var cfg DBGroupConfig
+		db.FirstOrCreate(&cfg)
+		cfg.GroupChatID = req.GroupChatID
+		if req.PSK != "" {
+			cfg.PSK = req.PSK
+		}
+		if err := db.Save(&cfg).Error; err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+			return
+		}
+
+		addLog(fmt.Sprintf("Group config updated: ChatID=%d", cfg.GroupChatID), "success")
+		json.NewEncoder(w).Encode(cfg)
+
+	default:
+		http.Error(w, `{"error":"Method not allowed"}`, http.StatusMethodNotAllowed)
+	}
 }

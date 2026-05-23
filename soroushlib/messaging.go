@@ -23,6 +23,15 @@ const (
 	// InputPeerUser — 0x7B8E7DE6
 	IDInputPeerUser uint32 = 0x7B8E7DE6
 
+	// InputPeerChat — 0x35A95CB9 (for group chats)
+	IDInputPeerChat uint32 = 0x35A95CB9
+
+	// PeerUser — 0x59511722
+	IDPeerUser uint32 = 0x59511722
+
+	// PeerChat — 0x36C6019A (group chat peer identifier)
+	IDPeerChat uint32 = 0x36C6019A
+
 	// updateShortMessage — 0x313BC7F8
 	IDUpdateShortMessage uint32 = 0x313BC7F8
 
@@ -74,6 +83,29 @@ func BuildSendTextMessage(userID int64, accessHash int64, text string, randomID 
 	return w.GetBytes()
 }
 
+// BuildSendGroupMessage builds a messages.sendMessage request to a group chat
+// chatID: the Soroush group chat ID
+// text: message body
+func BuildSendGroupMessage(chatID int64, text string, randomID int64) []byte {
+	w := NewTLWriter()
+	w.WriteUint32(IDSendMessage)
+
+	// flags = 0
+	w.WriteInt32(0)
+
+	// peer = InputPeerChat(chat_id)
+	w.WriteUint32(IDInputPeerChat)
+	w.WriteInt64(chatID)
+
+	// message text
+	w.WriteString(text)
+
+	// random_id
+	w.WriteInt64(randomID)
+
+	return w.GetBytes()
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Message listener — runs receive loop and dispatches incoming text messages
 // ──────────────────────────────────────────────────────────────────────────────
@@ -84,6 +116,8 @@ type IncomingMessage struct {
 	Text       string
 	Date       int32
 	MessageID  int32
+	ChatID     int64 // non-zero if this is a group message
+	IsGroup    bool  // true if message came from a group chat
 }
 
 // ListenForMessages runs a blocking receive loop on the given session.
@@ -226,9 +260,20 @@ func parseUpdateNewMessage(r *TLReader, handler func(msg IncomingMessage)) {
 		fromUserID, _ = r.ReadInt64()
 	}
 
-	// peer_id (PeerUser)
-	r.ReadUint32() // PeerUser constructor
-	r.ReadInt64()  // peer user_id
+	// peer_id — can be PeerUser or PeerChat (group)
+	var chatID int64
+	var isGroup bool
+	peerCID, _ := r.ReadUint32()
+	switch peerCID {
+	case IDPeerChat:
+		chatID, _ = r.ReadInt64()
+		isGroup = true
+	case IDPeerUser:
+		r.ReadInt64() // peer user_id (not needed, we have from_id)
+	default:
+		// Unknown peer type — try to read int64 and continue
+		r.ReadInt64()
+	}
 
 	// message text
 	text, _ := r.ReadString()
@@ -238,6 +283,8 @@ func parseUpdateNewMessage(r *TLReader, handler func(msg IncomingMessage)) {
 			FromUserID: fromUserID,
 			Text:       text,
 			MessageID:  msgID,
+			ChatID:     chatID,
+			IsGroup:    isGroup,
 		})
 	}
 }
@@ -270,6 +317,19 @@ func SendTextMessage(ctx context.Context, session *MTProtoSession, userID int64,
 		return fmt.Errorf("send text message: %w", err)
 	}
 	log.Printf("[Messaging] Sent message to user %d: %s", userID, truncate(text, 50))
+	return nil
+}
+
+// SendGroupMessage sends a text message to a Soroush group chat via MTProto
+func SendGroupMessage(ctx context.Context, session *MTProtoSession, chatID int64, text string) error {
+	randomID := time.Now().UnixNano()
+	body := BuildSendGroupMessage(chatID, text, randomID)
+
+	_, err := session.Send(ctx, body, true)
+	if err != nil {
+		return fmt.Errorf("send group message: %w", err)
+	}
+	log.Printf("[Messaging] Sent group message to chat %d: %s", chatID, truncate(text, 50))
 	return nil
 }
 
@@ -338,6 +398,70 @@ func parseI64(b []byte) (int64, error) {
 // FormatDispatcherResponse formats a worker assignment response
 func FormatDispatcherResponse(workerUserID int64, workerAccessHash int64) string {
 	return fmt.Sprintf("%s%d:%d", DispatcherAckRoutePrefix, workerUserID, workerAccessHash)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SDP Exchange Protocol — direct messages for WebRTC signaling
+// ──────────────────────────────────────────────────────────────────────────────
+
+const (
+	// SDPOfferPrefix is sent by client to worker with the SDP offer
+	SDPOfferPrefix = "SDP_OFFER:"
+
+	// SDPAnswerPrefix is sent by worker to client with the SDP answer
+	SDPAnswerPrefix = "SDP_ANSWER:"
+
+	// ICECandidatePrefix is sent by both peers to exchange ICE candidates
+	ICECandidatePrefix = "ICE:"
+)
+
+// IsSDPOffer checks if a message is an SDP offer
+func IsSDPOffer(text string) bool {
+	return strings.HasPrefix(text, SDPOfferPrefix)
+}
+
+// IsSDPAnswer checks if a message is an SDP answer
+func IsSDPAnswer(text string) bool {
+	return strings.HasPrefix(text, SDPAnswerPrefix)
+}
+
+// IsICECandidate checks if a message is an ICE candidate
+func IsICECandidate(text string) bool {
+	return strings.HasPrefix(text, ICECandidatePrefix)
+}
+
+// ExtractSDP extracts the SDP payload from an SDP_OFFER: or SDP_ANSWER: message
+func ExtractSDP(text string) string {
+	if strings.HasPrefix(text, SDPOfferPrefix) {
+		return text[len(SDPOfferPrefix):]
+	}
+	if strings.HasPrefix(text, SDPAnswerPrefix) {
+		return text[len(SDPAnswerPrefix):]
+	}
+	return ""
+}
+
+// ExtractICECandidate extracts the ICE candidate JSON from an ICE: message
+func ExtractICECandidate(text string) string {
+	if strings.HasPrefix(text, ICECandidatePrefix) {
+		return text[len(ICECandidatePrefix):]
+	}
+	return ""
+}
+
+// FormatSDPOffer wraps an SDP string as an offer message
+func FormatSDPOffer(sdp string) string {
+	return SDPOfferPrefix + sdp
+}
+
+// FormatSDPAnswer wraps an SDP string as an answer message
+func FormatSDPAnswer(sdp string) string {
+	return SDPAnswerPrefix + sdp
+}
+
+// FormatICECandidate wraps an ICE candidate JSON string
+func FormatICECandidate(candidateJSON string) string {
+	return ICECandidatePrefix + candidateJSON
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

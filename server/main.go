@@ -127,6 +127,7 @@ func main() {
 	mux.HandleFunc("/api/tunnel/status", JWTMiddleware(handleServerTunnelStatus))
 	mux.HandleFunc("/api/infra/test", JWTMiddleware(handleInfraTest))
 	mux.HandleFunc("/api/infra/status", JWTMiddleware(handleInfraStatus))
+	mux.HandleFunc("/api/group/config", JWTMiddleware(handleGroupConfig))
 	mux.HandleFunc("/api/logs", JWTMiddleware(handleGetLogs))
 
 	// CORS Preflight handler

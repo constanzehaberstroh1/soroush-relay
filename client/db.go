@@ -39,11 +39,13 @@ type DBSoroushAccount struct {
 	CreatedAt     time.Time `json:"createdAt"`
 }
 
-// DBTunnelConfig stores the dispatcher account configuration
+// DBTunnelConfig stores the tunnel configuration (group bus + legacy dispatcher)
 type DBTunnelConfig struct {
-	ID                   uint  `gorm:"primaryKey" json:"id"`
-	DispatcherUserID     int64 `json:"dispatcherUserId"`
-	DispatcherAccessHash int64 `json:"dispatcherAccessHash"`
+	ID                   uint   `gorm:"primaryKey" json:"id"`
+	GroupChatID          int64  `json:"groupChatId"`          // "My lovely family" group chat ID
+	PSK                  string `json:"psk"`                  // Pre-shared key for stealth encoding
+	DispatcherUserID     int64  `json:"dispatcherUserId"`     // Legacy: direct dispatcher
+	DispatcherAccessHash int64  `json:"dispatcherAccessHash"` // Legacy: direct dispatcher
 }
 
 // Initialize SQLite database

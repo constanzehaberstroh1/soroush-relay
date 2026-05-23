@@ -100,6 +100,7 @@ func main() {
 	mux.HandleFunc("/api/accounts/request-otp", JWTMiddleware(handleRequestOTP))
 	mux.HandleFunc("/api/accounts/verify-otp", JWTMiddleware(handleVerifyOTP))
 	mux.HandleFunc("/api/test-server", JWTMiddleware(handleTestServerConnection))
+	mux.HandleFunc("/api/tunnel/test", JWTMiddleware(handleTunnelTest))
 	mux.HandleFunc("/api/logs", JWTMiddleware(handleGetLogs))
 
 	// CORS Preflight handler
