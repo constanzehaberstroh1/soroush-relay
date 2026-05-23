@@ -1,0 +1,12 @@
+{
+  "apps": [
+    {
+      "app_id": "app_25d61cc9-bc8f-4d35-8fd8-c1a24ad4abb7",
+      "org_id": "user_eca29c4e-0fbb-4aac-a335-c8fd3c067c27",
+      "deploy_url": "https://github.com/constanzehaberstroh1/soroush-relay.git",
+      "git_ssh_url": "https://github.com/constanzehaberstroh1/soroush-relay.git",
+      "name": "soroush-relay",
+      "alias": "soroush-relay"
+    }
+  ]
+}

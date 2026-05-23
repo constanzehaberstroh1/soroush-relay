@@ -8,6 +8,8 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -52,7 +54,14 @@ var state = &ServerState{
 }
 
 func main() {
-	port := flag.Int("port", 8080, "Port to launch the server admin panel")
+	defaultPort := 8080
+	if envPort := os.Getenv("PORT"); envPort != "" {
+		if p, err := strconv.Atoi(envPort); err == nil {
+			defaultPort = p
+		}
+	}
+
+	port := flag.Int("port", defaultPort, "Port to launch the server admin panel")
 	flag.Parse()
 
 	// Get embedded assets filesystem
@@ -86,7 +95,7 @@ func main() {
 		fileServer.ServeHTTP(w, r)
 	})
 
-	addr := fmt.Sprintf("127.0.0.1:%d", *port)
+	addr := fmt.Sprintf("0.0.0.0:%d", *port)
 	fmt.Println("==========================================================")
 	fmt.Printf(" Soroush WebRTC Relay SERVER Panel launched on http://%s\n", addr)
 	fmt.Println("==========================================================")

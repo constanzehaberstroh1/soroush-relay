@@ -1,0 +1,17 @@
+.git
+.gitignore
+.dockerignore
+.idea
+.vscode
+.clever.json
+node_modules/
+bin/
+client/dist/
+server/dist/
+client-panel/dist/
+server-panel/dist/
+docker-compose.yml
+Makefile
+setup.sh
+research/
+researchs/
