@@ -6,6 +6,17 @@ bin/
 *.so
 *.dylib
 
+# Go build artifacts (prevent `go build ./...` dumping binaries in source dirs)
+client/client
+server/server
+*.test
+
+# SQLite databases (local dev only)
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
 # Production build distributions (rebuilt on each make call)
 client-panel/dist/
 server-panel/dist/

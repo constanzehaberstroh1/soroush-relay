@@ -56,21 +56,83 @@ var state = &ServerState{
 // Global signaling logs slice shared across files
 var (
 	logsMu     sync.Mutex
-	globalLogs = []map[string]string{
-		{"timestamp": time.Now().Format("15:04:05"), "type": "info", "message": "Soroush exit node engine initialized."},
-		{"timestamp": time.Now().Format("15:04:05"), "type": "success", "message": "WebRTC Signaling handler active on path /apiws"},
-		{"timestamp": time.Now().Format("15:04:05"), "type": "info", "message": "Ready to route decapsulated tunnel traffic to open Web"},
-	}
+	globalLogs = []map[string]string{}
+	logCh      = make(chan DBLogEntry, 100)
 )
 
+// DBLogEntry persists logs to MySQL
+type DBLogEntry struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	Timestamp string    `gorm:"size:191" json:"timestamp"`
+	Type      string    `gorm:"size:50" json:"type"`
+	Message   string    `gorm:"type:text" json:"message"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
 func addLog(message string, typeStr string) {
+	now := time.Now()
+	entry := map[string]string{
+		"timestamp": now.Format("2006-01-02 15:04:05"),
+		"type":      typeStr,
+		"message":   message,
+	}
+
+	logsMu.Lock()
+	globalLogs = append([]map[string]string{entry}, globalLogs...)
+	if len(globalLogs) > 500 {
+		globalLogs = globalLogs[:500]
+	}
+	logsMu.Unlock()
+
+	// Non-blocking send to async writer channel
+	select {
+	case logCh <- DBLogEntry{
+		Timestamp: entry["timestamp"],
+		Type:      typeStr,
+		Message:   message,
+		CreatedAt: now,
+	}:
+	default:
+		// Channel full — drop DB write to avoid blocking
+	}
+}
+
+// startLogWriter starts a single background goroutine that drains
+// the log channel and persists entries to DB without blocking callers
+func startLogWriter() {
+	go func() {
+		pruneCounter := 0
+		for entry := range logCh {
+			if db != nil {
+				db.Create(&entry)
+				pruneCounter++
+				if pruneCounter >= 50 {
+					pruneCounter = 0
+					var count int64
+					db.Model(&DBLogEntry{}).Count(&count)
+					if count > 500 {
+						db.Exec("DELETE FROM db_log_entries WHERE id NOT IN (SELECT id FROM db_log_entries ORDER BY id DESC LIMIT 500)")
+					}
+				}
+			}
+		}
+	}()
+}
+
+// loadLogsFromDB loads persisted logs into memory on startup
+func loadLogsFromDB() {
+	var entries []DBLogEntry
+	if err := db.Order("id desc").Limit(500).Find(&entries).Error; err != nil {
+		return
+	}
 	logsMu.Lock()
 	defer logsMu.Unlock()
-	globalLogs = append([]map[string]string{
-		{"timestamp": time.Now().Format("15:04:05"), "type": typeStr, "message": message},
-	}, globalLogs...)
-	if len(globalLogs) > 100 {
-		globalLogs = globalLogs[:100]
+	for _, e := range entries {
+		globalLogs = append(globalLogs, map[string]string{
+			"timestamp": e.Timestamp,
+			"type":      e.Type,
+			"message":   e.Message,
+		})
 	}
 }
 
@@ -85,8 +147,13 @@ func main() {
 	port := flag.Int("port", defaultPort, "Port to launch the server admin panel")
 	flag.Parse()
 
-	// 1. Initialize SQLite database for Server exit node
+	// 1. Initialize MySQL database for Server exit node
 	initDB()
+
+	// Load persisted logs from DB
+	loadLogsFromDB()
+	startLogWriter()
+	addLog("Soroush exit node engine started.", "info")
 
 	// Get embedded assets filesystem
 	var distFS fs.FS
@@ -128,7 +195,9 @@ func main() {
 	mux.HandleFunc("/api/infra/test", JWTMiddleware(handleInfraTest))
 	mux.HandleFunc("/api/infra/status", JWTMiddleware(handleInfraStatus))
 	mux.HandleFunc("/api/group/config", JWTMiddleware(handleGroupConfig))
+	mux.HandleFunc("/api/groups/list", JWTMiddleware(handleFetchGroups))
 	mux.HandleFunc("/api/logs", JWTMiddleware(handleGetLogs))
+	mux.HandleFunc("/api/logs/clear", JWTMiddleware(handleClearLogs))
 
 	// CORS Preflight handler
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
@@ -286,4 +355,21 @@ func handleGetLogs(w http.ResponseWriter, r *http.Request) {
 	defer logsMu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(globalLogs)
+}
+
+func handleClearLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	logsMu.Lock()
+	globalLogs = []map[string]string{}
+	logsMu.Unlock()
+
+	// Clear from DB too
+	db.Exec("DELETE FROM db_log_entries")
+
+	addLog("Logs cleared by admin.", "info")
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"message":"Logs cleared"}`))
 }

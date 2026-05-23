@@ -378,3 +378,105 @@ func unwrapResponse(cid uint32, r *soroushlib.TLReader, expectedMsgID int64) (ui
 		return cid, r
 	}
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Fetch Groups — uses any available account to fetch the user's group list
+// ──────────────────────────────────────────────────────────────────────────────
+
+func handleFetchGroups(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	var account DBSoroushAccount
+	if err := db.Where("status = ? AND auth_key IS NOT NULL AND LENGTH(auth_key) > 0", "connected").First(&account).Error; err != nil {
+		http.Error(w, `{"error":"No connected account available. Please add and verify a Soroush account first."}`, http.StatusNotFound)
+		return
+	}
+
+	recordSystemLog(fmt.Sprintf("[Groups] Fetching group list using account: %s", soroushlib.MaskPhone(account.PhoneNumber)), "info")
+
+	session, transport := soroushlib.RestoreSession(account.AuthKey, account.AuthKeyID, account.ServerSalt)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if err := transport.Connect(ctx); err != nil {
+		recordSystemLog(fmt.Sprintf("[Groups] Transport connect failed: %v", err), "error")
+		http.Error(w, fmt.Sprintf(`{"error":"Transport connect failed: %s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer transport.Disconnect()
+
+	body := soroushlib.BuildGetDialogsRequest()
+	wrappedBody := soroushlib.WrapInitConnection(soroushlib.SoroushAppID, body)
+
+	recvCh := make(chan recvResult, 1)
+	go func() {
+		cid, reader, err := session.Recv(ctx)
+		recvCh <- recvResult{cid: cid, reader: reader, err: err}
+	}()
+
+	msgID, err := session.Send(ctx, wrappedBody, true)
+	if err != nil {
+		recordSystemLog(fmt.Sprintf("[Groups] Send failed: %v", err), "error")
+		http.Error(w, fmt.Sprintf(`{"error":"Send failed: %s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	for attempt := 0; attempt < 3; attempt++ {
+		result := <-recvCh
+		if result.err != nil {
+			recordSystemLog(fmt.Sprintf("[Groups] Recv failed: %v", result.err), "error")
+			http.Error(w, fmt.Sprintf(`{"error":"Recv failed: %s"}`, result.err.Error()), http.StatusInternalServerError)
+			return
+		}
+
+		innerCID, innerReader := unwrapResponse(result.cid, result.reader, msgID)
+
+		if innerCID == soroushlib.IDBadServerSalt {
+			innerReader.ReadInt64()
+			innerReader.ReadInt32()
+			innerReader.ReadInt32()
+			newSalt, _ := innerReader.ReadInt64()
+			session.ServerSalt = newSalt
+			go func() {
+				cid, reader, err := session.Recv(ctx)
+				recvCh <- recvResult{cid: cid, reader: reader, err: err}
+			}()
+			msgID, _ = session.Send(ctx, wrappedBody, true)
+			continue
+		}
+
+		if innerCID == soroushlib.IDNewSession {
+			innerReader.ReadInt64()
+			innerReader.ReadInt64()
+			newSalt, _ := innerReader.ReadInt64()
+			session.ServerSalt = newSalt
+			go func() {
+				cid, reader, err := session.Recv(ctx)
+				recvCh <- recvResult{cid: cid, reader: reader, err: err}
+			}()
+			continue
+		}
+
+		groups, err := soroushlib.ParseDialogsForGroups(innerCID, innerReader)
+		if err != nil {
+			recordSystemLog(fmt.Sprintf("[Groups] Parse failed: %v", err), "error")
+			http.Error(w, fmt.Sprintf(`{"error":"Parse failed: %s"}`, err.Error()), http.StatusInternalServerError)
+			return
+		}
+
+		recordSystemLog(fmt.Sprintf("[Groups] Found %d groups/channels", len(groups)), "success")
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(groups)
+		return
+	}
+
+	http.Error(w, `{"error":"Failed to fetch groups after retries"}`, http.StatusInternalServerError)
+}

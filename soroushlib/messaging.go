@@ -13,6 +13,7 @@ import (
 // MTProto constructor IDs for messaging (Soroush / Telegram-derived)
 // ──────────────────────────────────────────────────────────────────────────────
 
+
 const (
 	// messages.sendMessage — 0x280D096F (TL schema)
 	IDSendMessage uint32 = 0x280D096F
@@ -52,7 +53,292 @@ const (
 
 	// updateShortSentMessage — 0x9015E101
 	IDUpdateShortSentMessage uint32 = 0x9015E101
+
+	// InputPeerEmpty — 0x7F3B18EA
+	IDInputPeerEmpty uint32 = 0x7F3B18EA
+
+	// messages.dialogs — 0x15BA6C40
+	IDDialogs uint32 = 0x15BA6C40
+
+	// messages.dialogsSlice — 0x71E094F3
+	IDDialogsSlice uint32 = 0x71E094F3
+
+	// dialog — 0xD58A08C6
+	IDDialog uint32 = 0xD58A08C6
+
+	// PeerChannel — 0xA2A5371E
+	IDPeerChannel uint32 = 0xA2A5371E
+
+	// chat — 0x41CBF256
+	IDChat uint32 = 0x41CBF256
+
+	// chatForbidden — 0x6592A1A7
+	IDChatForbidden uint32 = 0x6592A1A7
+
+	// channel — 0x0AADFC8F (or 0x94F592DB in some layers)
+	IDChannel uint32 = 0x0AADFC8F
+
+	// channelForbidden — 0x17D493D5
+	IDChannelForbidden uint32 = 0x17D493D5
 )
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Build messages.getDialogs TL payload
+// ──────────────────────────────────────────────────────────────────────────────
+
+// DialogInfo represents a chat/group from the user's dialog list
+type DialogInfo struct {
+	ID           int64  `json:"id"`
+	Title        string `json:"title"`
+	Type         string `json:"type"` // "group", "channel", "supergroup"
+	MembersCount int32  `json:"membersCount"`
+}
+
+// BuildGetDialogsRequest builds a messages.getDialogs request
+// This fetches the user's chat list (groups, channels, DMs)
+func BuildGetDialogsRequest() []byte {
+	w := NewTLWriter()
+	w.WriteUint32(IDGetDialogs)
+
+	// flags = 0 (no exclude_pinned, folder_id, etc.)
+	w.WriteInt32(0)
+
+	// offset_date = 0
+	w.WriteInt32(0)
+
+	// offset_id = 0
+	w.WriteInt32(0)
+
+	// offset_peer = InputPeerEmpty
+	w.WriteUint32(IDInputPeerEmpty)
+
+	// limit = 100
+	w.WriteInt32(100)
+
+	// hash = 0
+	w.WriteInt64(0)
+
+	return w.GetBytes()
+}
+
+// ParseDialogsForGroups extracts group chats from a messages.getDialogs response
+// It scans the chats vector within the response for Chat and Channel objects
+func ParseDialogsForGroups(cid uint32, r *TLReader) ([]DialogInfo, error) {
+	if cid == IDRPCError {
+		return nil, ParseRPCError(r)
+	}
+
+	// Both messages.dialogs and messages.dialogsSlice have similar structures
+	// messages.dialogsSlice has an extra count field at the start
+	if cid == IDDialogsSlice {
+		r.ReadInt32() // count
+	} else if cid != IDDialogs {
+		return nil, fmt.Errorf("unexpected response cid=0x%08X for getDialogs", cid)
+	}
+
+	// Skip dialogs vector
+	skipTLVector(r)
+
+	// Skip messages vector
+	skipTLVector(r)
+
+	// Parse chats vector — this is where groups/channels live
+	groups := parseChatVector(r)
+
+	return groups, nil
+}
+
+// skipTLVector skips over a TL vector (reads and discards all elements)
+func skipTLVector(r *TLReader) {
+	r.ReadUint32() // vector constructor ID
+	count, _ := r.ReadInt32()
+	for i := int32(0); i < count; i++ {
+		// We don't know the exact size of each element, so we skip by reading
+		// the constructor and trying to parse minimally
+		// For dialogs and messages, we'll just skip a reasonable amount
+		startPos := r.Remaining()
+		skipTLObject(r)
+		// If we didn't consume anything, break to avoid infinite loop
+		if r.Remaining() == startPos {
+			break
+		}
+	}
+}
+
+// skipTLObject tries to skip a single TL object (best-effort for dialogs/messages)
+func skipTLObject(r *TLReader) {
+	cid, err := r.ReadUint32()
+	if err != nil {
+		return
+	}
+
+	switch cid {
+	case IDDialog: // dialog#d58a08c6
+		r.ReadInt32()  // flags
+		r.ReadUint32() // peer constructor
+		r.ReadInt64()  // peer id
+		r.ReadInt32()  // top_message
+		r.ReadInt32()  // read_inbox_max_id
+		r.ReadInt32()  // read_outbox_max_id
+		r.ReadInt32()  // unread_count
+		r.ReadInt32()  // unread_mentions_count
+		r.ReadInt32()  // unread_reactions_count
+		// notify_settings (peerNotifySettings)
+		skipNotifySettings(r)
+	case IDMessage: // message
+		flags, _ := r.ReadInt32()
+		r.ReadInt32() // id
+		if flags&(1<<8) != 0 {
+			r.ReadUint32() // from_id peer constructor
+			r.ReadInt64()  // from_id value
+		}
+		r.ReadUint32() // peer_id constructor
+		r.ReadInt64()  // peer_id value
+		// We can't reliably skip the rest, so stop here
+	default:
+		// Unknown — try to skip a few fields
+		for j := 0; j < 8; j++ {
+			if r.Remaining() <= 0 {
+				break
+			}
+			r.ReadInt32()
+		}
+	}
+}
+
+// skipNotifySettings skips a peerNotifySettings object
+func skipNotifySettings(r *TLReader) {
+	r.ReadUint32() // constructor
+	flags, _ := r.ReadInt32()
+	if flags&(1<<0) != 0 {
+		r.ReadInt32() // show_previews (Bool)
+	}
+	if flags&(1<<1) != 0 {
+		r.ReadInt32() // silent (Bool)
+	}
+	if flags&(1<<2) != 0 {
+		r.ReadInt32() // mute_until
+	}
+	if flags&(1<<3) != 0 {
+		r.ReadString() // sound (NotificationSound — skip as string)
+	}
+}
+
+// parseChatVector parses the chats vector and extracts group/channel info
+func parseChatVector(r *TLReader) []DialogInfo {
+	var groups []DialogInfo
+
+	r.ReadUint32() // vector constructor ID (0x1cb5c415)
+	count, err := r.ReadInt32()
+	if err != nil || count <= 0 {
+		return groups
+	}
+
+	for i := int32(0); i < count; i++ {
+		cid, err := r.ReadUint32()
+		if err != nil {
+			break
+		}
+
+		switch cid {
+		case IDChat, 0x29562865: // chat or chatEmpty variants
+			info := parseChatObject(r, cid)
+			if info != nil {
+				groups = append(groups, *info)
+			}
+		case IDChannel, 0x94F592DB, 0x8261AC61: // channel variants across layers
+			info := parseChannelObject(r, cid)
+			if info != nil {
+				groups = append(groups, *info)
+			}
+		case IDChatForbidden:
+			// chat_id + title
+			id, _ := r.ReadInt64()
+			title, _ := r.ReadString()
+			groups = append(groups, DialogInfo{
+				ID:    id,
+				Title: title + " (forbidden)",
+				Type:  "group",
+			})
+		case IDChannelForbidden:
+			flags, _ := r.ReadInt32()
+			id, _ := r.ReadInt64()
+			_ = flags
+			r.ReadInt64() // access_hash
+			title, _ := r.ReadString()
+			groups = append(groups, DialogInfo{
+				ID:    id,
+				Title: title + " (forbidden)",
+				Type:  "channel",
+			})
+		default:
+			// Unknown chat type — try to skip
+			log.Printf("[Dialogs] Unknown chat constructor: 0x%08X", cid)
+			// Read some fields to try to advance
+			r.ReadInt64()
+			r.ReadString()
+		}
+	}
+
+	return groups
+}
+
+// parseChatObject parses a chat (group) TL object
+func parseChatObject(r *TLReader, cid uint32) *DialogInfo {
+	flags, _ := r.ReadInt32()
+	id, _ := r.ReadInt64()
+	title, _ := r.ReadString()
+
+	// photo — skip
+	photoCID, _ := r.ReadUint32()
+	if photoCID != 0x37C1011C { // chatPhotoEmpty
+		// chatPhoto — skip fields
+		r.ReadInt32()  // flags
+		r.ReadInt64()  // photo_id
+		if r.Remaining() > 8 {
+			r.ReadBytes() // stripped_thumb (optional based on flags)
+		}
+		r.ReadInt32() // dc_id
+	}
+
+	participantsCount, _ := r.ReadInt32()
+	r.ReadInt32() // date
+	r.ReadInt32() // version
+
+	_ = flags
+
+	return &DialogInfo{
+		ID:           id,
+		Title:        title,
+		Type:         "group",
+		MembersCount: participantsCount,
+	}
+}
+
+// parseChannelObject parses a channel/supergroup TL object
+func parseChannelObject(r *TLReader, cid uint32) *DialogInfo {
+	flags, _ := r.ReadInt32()
+	_ = flags
+	id, _ := r.ReadInt64()
+
+	// access_hash (if flags bit 13)
+	if flags&(1<<13) != 0 {
+		r.ReadInt64()
+	}
+
+	title, _ := r.ReadString()
+
+	chatType := "channel"
+	if flags&(1<<8) != 0 { // megagroup flag
+		chatType = "supergroup"
+	}
+
+	return &DialogInfo{
+		ID:    id,
+		Title: title,
+		Type:  chatType,
+	}
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Build messages.sendMessage TL payload

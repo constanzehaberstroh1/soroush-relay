@@ -89,7 +89,7 @@ func initDB() {
 	fmt.Println("[DB] MySQL database connection established successfully.")
 
 	// Auto migrate tables (supports GORM migrations inside MySQL)
-	err = db.AutoMigrate(&DBAdmin{}, &DBSoroushAccount{}, &DBGroupConfig{})
+	err = db.AutoMigrate(&DBAdmin{}, &DBSoroushAccount{}, &DBGroupConfig{}, &DBLogEntry{})
 	if err != nil {
 		log.Fatalf("[DB] Database migration failed: %v", err)
 	}

@@ -60,7 +60,7 @@ func initDB() {
 	fmt.Println("[DB] SQLite database initialized successfully: client_config.db")
 
 	// Auto migrate tables
-	err = db.AutoMigrate(&DBAdmin{}, &DBSoroushAccount{}, &DBTunnelConfig{})
+	err = db.AutoMigrate(&DBAdmin{}, &DBSoroushAccount{}, &DBTunnelConfig{}, &DBLogEntry{})
 	if err != nil {
 		log.Fatalf("[DB] Database migration failed: %v", err)
 	}

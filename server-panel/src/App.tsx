@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
   ThemeProvider,
   CssBaseline,
@@ -699,6 +699,13 @@ function ConfigView() {
   const [groupSaving, setGroupSaving] = useState(false);
   const [groupSaved, setGroupSaved] = useState(false);
 
+  // Group Picker Modal state
+  const [groupPickerOpen, setGroupPickerOpen] = useState(false);
+  const [groupPickerLoading, setGroupPickerLoading] = useState(false);
+  const [groupPickerError, setGroupPickerError] = useState('');
+  const [groupPickerSearch, setGroupPickerSearch] = useState('');
+  const [groupList, setGroupList] = useState<{ id: number; title: string; type: string; membersCount: number }[]>([]);
+
   const fetchConfig = async () => {
     try {
       const res = await fetch(`${API_BASE}/config`, { headers: getHeaders() });
@@ -769,6 +776,33 @@ function ConfigView() {
 
   const handleRestartServer = () => {
     alert('Graceful restart trace dispatched to signaling coordinator.');
+  };
+
+  const handleOpenGroupPicker = async () => {
+    setGroupPickerOpen(true);
+    setGroupPickerLoading(true);
+    setGroupPickerError('');
+    setGroupList([]);
+    try {
+      const res = await fetch(`${API_BASE}/groups/list`, { headers: getHeaders() });
+      if (res.ok) {
+        const data = await res.json();
+        setGroupList(data || []);
+      } else {
+        const err = await res.json();
+        setGroupPickerError(err.error || 'Failed to fetch groups.');
+      }
+    } catch {
+      setGroupPickerError('Connection error. Make sure you have a connected Soroush account.');
+    } finally {
+      setGroupPickerLoading(false);
+    }
+  };
+
+  const handleSelectGroup = (group: { id: number; title: string }) => {
+    setGroupChatId(String(group.id));
+    setGroupSaved(false);
+    setGroupPickerOpen(false);
   };
 
   return (
@@ -867,18 +901,29 @@ function ConfigView() {
 
           <Grid container spacing={3}>
             <Grid item xs={12} sm={6}>
-              <TextField
-                label="Group Chat ID"
-                placeholder="e.g. -1001234567890"
-                value={groupChatId}
-                onChange={(e) => { setGroupChatId(e.target.value); setGroupSaved(false); }}
-                fullWidth
-                size="small"
-                helperText="The Soroush group chat ID where stealth commands are exchanged."
-                InputProps={{
-                  style: { fontFamily: 'monospace' },
-                }}
-              />
+              <Box display="flex" gap={1} alignItems="flex-start">
+                <TextField
+                  label="Group Chat ID"
+                  placeholder="e.g. -1001234567890"
+                  value={groupChatId}
+                  onChange={(e) => { setGroupChatId(e.target.value); setGroupSaved(false); }}
+                  fullWidth
+                  size="small"
+                  helperText="The Soroush group chat ID where stealth commands are exchanged."
+                  InputProps={{
+                    style: { fontFamily: 'monospace' },
+                  }}
+                />
+                <Button
+                  customVariant="secondary"
+                  size="small"
+                  onClick={handleOpenGroupPicker}
+                  style={{ minWidth: 0, padding: '6px 12px', whiteSpace: 'nowrap', marginTop: '1px' }}
+                  startIcon={<UsersIcon style={{ fontSize: 16 }} />}
+                >
+                  Browse
+                </Button>
+              </Box>
             </Grid>
             <Grid item xs={12} sm={6}>
               <TextField
@@ -931,6 +976,144 @@ function ConfigView() {
           </Paper>
         </CardContent>
       </Card>
+      {/* Group Picker Modal */}
+      <Dialog
+        open={groupPickerOpen}
+        onClose={() => setGroupPickerOpen(false)}
+        fullWidth
+        maxWidth="sm"
+        PaperProps={{
+          sx: {
+            bgcolor: '#0f172a',
+            border: '1px solid rgba(255,255,255,0.08)',
+            borderRadius: 3,
+          }
+        }}
+      >
+        <DialogTitle fontWeight={800} sx={{ pb: 1 }}>
+          <Box display="flex" alignItems="center" gap={1}>
+            <UsersIcon color="primary" />
+            Select Group Chat
+          </Box>
+          <Typography variant="caption" color="text.secondary" display="block" mt={0.5}>
+            Choose a Soroush group from your account's chat list. The group ID will be auto-filled.
+          </Typography>
+        </DialogTitle>
+        <DialogContent>
+          {groupPickerLoading ? (
+            <Box display="flex" flexDirection="column" alignItems="center" py={6} gap={2}>
+              <CircularProgress size={36} />
+              <Typography variant="body2" color="text.secondary">
+                Connecting to Soroush and fetching groups...
+              </Typography>
+            </Box>
+          ) : groupPickerError ? (
+            <Alert severity="error" sx={{ borderRadius: 2 }}>
+              {groupPickerError}
+            </Alert>
+          ) : (
+            <>
+              <TextField
+                label="Search groups..."
+                placeholder="Filter by name..."
+                value={groupPickerSearch}
+                onChange={(e) => setGroupPickerSearch(e.target.value)}
+                fullWidth
+                size="small"
+                sx={{ mb: 2 }}
+              />
+              <Box sx={{
+                maxHeight: 380,
+                overflowY: 'auto',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 1,
+                '&::-webkit-scrollbar': { width: '6px' },
+                '&::-webkit-scrollbar-thumb': { bgcolor: 'rgba(255,255,255,0.1)', borderRadius: '3px' },
+              }}>
+                {groupList
+                  .filter(g => g.title.toLowerCase().includes(groupPickerSearch.toLowerCase()))
+                  .map((group) => (
+                  <Paper
+                    key={group.id}
+                    variant="outlined"
+                    onClick={() => handleSelectGroup(group)}
+                    sx={{
+                      p: 2,
+                      cursor: 'pointer',
+                      bgcolor: 'rgba(255,255,255,0.02)',
+                      border: '1px solid rgba(255,255,255,0.06)',
+                      borderRadius: 2,
+                      transition: 'all 0.2s ease',
+                      '&:hover': {
+                        bgcolor: 'rgba(139, 92, 246, 0.08)',
+                        borderColor: 'rgba(139, 92, 246, 0.3)',
+                        transform: 'translateX(4px)',
+                      },
+                    }}
+                  >
+                    <Box display="flex" alignItems="center" justifyContent="space-between">
+                      <Box display="flex" alignItems="center" gap={1.5}>
+                        <Box
+                          sx={{
+                            width: 36,
+                            height: 36,
+                            borderRadius: 2,
+                            bgcolor: group.type === 'group' ? 'rgba(16, 185, 129, 0.15)' :
+                                     group.type === 'supergroup' ? 'rgba(139, 92, 246, 0.15)' :
+                                     'rgba(59, 130, 246, 0.15)',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            flexShrink: 0,
+                          }}
+                        >
+                          <UsersIcon sx={{
+                            fontSize: 18,
+                            color: group.type === 'group' ? '#10b981' :
+                                   group.type === 'supergroup' ? '#a78bfa' : '#3b82f6'
+                          }} />
+                        </Box>
+                        <Box>
+                          <Typography variant="body2" fontWeight={600}>
+                            {group.title}
+                          </Typography>
+                          <Box display="flex" alignItems="center" gap={1}>
+                            <Badge
+                              label={group.type}
+                              customVariant={group.type === 'group' ? 'online' : 'idle'}
+                            />
+                            <Typography variant="caption" color="text.secondary" sx={{ fontFamily: 'monospace' }}>
+                              ID: {group.id}
+                            </Typography>
+                            {group.membersCount > 0 && (
+                              <Typography variant="caption" color="text.secondary">
+                                · {group.membersCount} members
+                              </Typography>
+                            )}
+                          </Box>
+                        </Box>
+                      </Box>
+                    </Box>
+                  </Paper>
+                ))}
+                {groupList.filter(g => g.title.toLowerCase().includes(groupPickerSearch.toLowerCase())).length === 0 && (
+                  <Box py={4} textAlign="center">
+                    <Typography variant="body2" color="text.secondary">
+                      {groupList.length === 0 ? 'No groups found in this account.' : 'No groups match your search.'}
+                    </Typography>
+                  </Box>
+                )}
+              </Box>
+            </>
+          )}
+        </DialogContent>
+        <DialogActions sx={{ p: 2, pt: 0 }}>
+          <Button customVariant="secondary" onClick={() => setGroupPickerOpen(false)}>
+            Cancel
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 }
@@ -1295,6 +1478,9 @@ function InfraTestView() {
 // ──────────────────────────────────────────────────────────────────────────────
 function LogsView() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [filter, setFilter] = useState<string>('all');
+  const [autoScroll, setAutoScroll] = useState(true);
+  const logContainerRef = useRef<HTMLDivElement>(null);
 
   const fetchLogs = async () => {
     try {
@@ -1308,55 +1494,167 @@ function LogsView() {
     }
   };
 
+  const handleClearLogs = async () => {
+    if (!confirm('Clear all logs? This cannot be undone.')) return;
+    try {
+      await fetch(`${API_BASE}/logs/clear`, { method: 'POST', headers: getHeaders() });
+      fetchLogs();
+    } catch { /* ignore */ }
+  };
+
   useEffect(() => {
     fetchLogs();
     const interval = setInterval(fetchLogs, 1500);
-
     return () => clearInterval(interval);
   }, []);
+
+  useEffect(() => {
+    if (autoScroll && logContainerRef.current) {
+      logContainerRef.current.scrollTop = 0;
+    }
+  }, [logs, autoScroll]);
+
+  const filteredLogs = filter === 'all' ? logs : logs.filter(l => l.type === filter);
+
+  const logTypeCounts = {
+    all: logs.length,
+    info: logs.filter(l => l.type === 'info').length,
+    success: logs.filter(l => l.type === 'success').length,
+    warn: logs.filter(l => l.type === 'warn').length,
+    error: logs.filter(l => l.type === 'error').length,
+  };
+
+  const typeColors: Record<string, string> = {
+    info: '#94a3b8',
+    success: '#10b981',
+    warn: '#f59e0b',
+    error: '#ef4444',
+  };
+
+  const filterChips: { key: string; label: string; color: string }[] = [
+    { key: 'all', label: 'All', color: '#a78bfa' },
+    { key: 'info', label: 'Info', color: '#94a3b8' },
+    { key: 'success', label: 'Success', color: '#10b981' },
+    { key: 'warn', label: 'Warning', color: '#f59e0b' },
+    { key: 'error', label: 'Error', color: '#ef4444' },
+  ];
 
   return (
     <Card>
       <CardContent>
+        {/* Header with controls */}
         <Box display="flex" alignItems="center" justifyContent="space-between" mb={2}>
-          <Typography variant="h6" fontWeight={700}>
-            Signaling & P2P Routing Logs
-          </Typography>
-          <IconButton onClick={fetchLogs} color="primary" size="small">
-            <RefreshIcon fontSize="small" />
-          </IconButton>
+          <Box display="flex" alignItems="center" gap={1.5}>
+            <Typography variant="h6" fontWeight={700}>
+              Signaling & P2P Routing Logs
+            </Typography>
+            <Badge
+              label={`${logs.length} entries`}
+              customVariant="idle"
+            />
+          </Box>
+          <Box display="flex" alignItems="center" gap={1}>
+            <Badge
+              label={autoScroll ? "Auto-scroll ON" : "Auto-scroll OFF"}
+              customVariant={autoScroll ? "online" : "idle"}
+            />
+            <IconButton onClick={() => setAutoScroll(!autoScroll)} color="inherit" size="small">
+              <LogsIcon fontSize="small" />
+            </IconButton>
+            <IconButton onClick={fetchLogs} color="primary" size="small">
+              <RefreshIcon fontSize="small" />
+            </IconButton>
+            <Button
+              customVariant="danger"
+              size="small"
+              onClick={handleClearLogs}
+              style={{ padding: '3px 10px', fontSize: '0.7rem', minWidth: 0 }}
+            >
+              Clear
+            </Button>
+          </Box>
         </Box>
+
+        {/* Filter chips */}
+        <Box display="flex" gap={1} mb={2} flexWrap="wrap">
+          {filterChips.map(chip => (
+            <Box
+              key={chip.key}
+              onClick={() => setFilter(chip.key)}
+              sx={{
+                cursor: 'pointer',
+                px: 1.5,
+                py: 0.5,
+                borderRadius: 2,
+                fontSize: '0.72rem',
+                fontWeight: filter === chip.key ? 700 : 500,
+                bgcolor: filter === chip.key ? `${chip.color}22` : 'rgba(255,255,255,0.03)',
+                color: filter === chip.key ? chip.color : '#64748b',
+                border: '1px solid',
+                borderColor: filter === chip.key ? `${chip.color}44` : 'transparent',
+                transition: 'all 0.2s ease',
+                '&:hover': { bgcolor: `${chip.color}15` },
+                userSelect: 'none',
+              }}
+            >
+              {chip.label} ({logTypeCounts[chip.key as keyof typeof logTypeCounts]})
+            </Box>
+          ))}
+        </Box>
+
+        {/* Log container */}
         <Box
+          ref={logContainerRef}
           sx={{
-            height: 480,
+            height: 520,
             bgcolor: '#050212',
             borderRadius: 3,
-            p: 3,
+            p: 2,
             overflowY: 'auto',
-            fontFamily: 'Courier New, monospace',
-            fontSize: '0.85rem',
+            fontFamily: '"JetBrains Mono", "Fira Code", "Courier New", monospace',
+            fontSize: '0.8rem',
             display: 'flex',
             flexDirection: 'column',
-            gap: 1,
+            gap: 0.25,
             boxShadow: 'inset 0 2px 10px rgba(0,0,0,0.8)',
+            '&::-webkit-scrollbar': { width: '6px' },
+            '&::-webkit-scrollbar-track': { bgcolor: 'transparent' },
+            '&::-webkit-scrollbar-thumb': { bgcolor: 'rgba(255,255,255,0.1)', borderRadius: '3px' },
           }}
         >
-          {logs.length > 0 ? (
-            logs.map((log, index) => (
-              <Box key={index} display="flex" gap={1.5}>
-                <Box sx={{ color: '#64748b', userSelect: 'none' }}>
-                  [{log.timestamp}]
+          {filteredLogs.length > 0 ? (
+            filteredLogs.map((log, index) => (
+              <Box
+                key={index}
+                display="flex"
+                gap={1}
+                sx={{
+                  py: 0.4,
+                  px: 1,
+                  borderRadius: 1,
+                  '&:hover': { bgcolor: 'rgba(255,255,255,0.02)' },
+                  transition: 'background-color 0.15s ease',
+                }}
+              >
+                <Box
+                  sx={{
+                    width: 6,
+                    height: 6,
+                    borderRadius: '50%',
+                    bgcolor: typeColors[log.type] || '#94a3b8',
+                    mt: '7px',
+                    flexShrink: 0,
+                    boxShadow: `0 0 6px ${typeColors[log.type] || '#94a3b8'}60`,
+                  }}
+                />
+                <Box sx={{ color: '#475569', userSelect: 'none', flexShrink: 0, fontSize: '0.75rem', lineHeight: '1.6' }}>
+                  {log.timestamp}
                 </Box>
                 <Box
                   sx={{
-                    color:
-                      log.type === 'success'
-                        ? '#10b981'
-                        : log.type === 'warn'
-                        ? '#f59e0b'
-                        : log.type === 'error'
-                        ? '#ef4444'
-                        : '#94a3b8',
+                    color: typeColors[log.type] || '#94a3b8',
+                    lineHeight: '1.6',
+                    wordBreak: 'break-word',
                   }}
                 >
                   {log.message}
@@ -1364,8 +1662,11 @@ function LogsView() {
               </Box>
             ))
           ) : (
-            <Box py={4} textAlign="center" color="text.secondary">
-              Awaiting logs buffer payload...
+            <Box py={8} textAlign="center" color="text.secondary" display="flex" flexDirection="column" alignItems="center" gap={1}>
+              <LogsIcon sx={{ fontSize: 40, opacity: 0.15 }} />
+              <Typography variant="body2" color="text.secondary">
+                {filter !== 'all' ? `No ${filter} logs found.` : 'No logs recorded yet. Activity will appear here in real-time.'}
+              </Typography>
             </Box>
           )}
         </Box>
