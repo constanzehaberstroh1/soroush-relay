@@ -693,6 +693,12 @@ function ConfigView() {
   const [socksPort, setSocksPort] = useState<number>(1080);
   const [bandwidthLimit, setBandwidthLimit] = useState<number>(100);
 
+  // Group Bus Configuration state
+  const [groupChatId, setGroupChatId] = useState<string>('');
+  const [groupPsk, setGroupPsk] = useState<string>('');
+  const [groupSaving, setGroupSaving] = useState(false);
+  const [groupSaved, setGroupSaved] = useState(false);
+
   const fetchConfig = async () => {
     try {
       const res = await fetch(`${API_BASE}/config`, { headers: getHeaders() });
@@ -708,8 +714,20 @@ function ConfigView() {
     }
   };
 
+  // Load group config on mount
   useEffect(() => {
     fetchConfig();
+    const loadGroupConfig = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/group/config`, { headers: getHeaders() });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.groupChatId) setGroupChatId(String(data.groupChatId));
+          if (data.psk) setGroupPsk(data.psk);
+        }
+      } catch { /* ignore */ }
+    };
+    loadGroupConfig();
   }, []);
 
   const handleSaveConfig = async () => {
@@ -732,79 +750,188 @@ function ConfigView() {
     }
   };
 
+  const handleSaveGroupConfig = async () => {
+    setGroupSaving(true);
+    setGroupSaved(false);
+    try {
+      const res = await fetch(`${API_BASE}/group/config`, {
+        method: 'POST',
+        headers: getHeaders(),
+        body: JSON.stringify({
+          groupChatId: Number(groupChatId),
+          psk: groupPsk,
+        }),
+      });
+      if (res.ok) setGroupSaved(true);
+    } catch { /* ignore */ }
+    finally { setGroupSaving(false); }
+  };
+
   const handleRestartServer = () => {
     alert('Graceful restart trace dispatched to signaling coordinator.');
   };
 
   return (
-    <Card>
-      <CardContent>
-        <Typography variant="h6" fontWeight={700} mb={2}>
-          Engine Gateway Settings
-        </Typography>
-        
-        <Grid container spacing={3}>
-          <Grid item xs={12} sm={6}>
-            <TextField
-              label="HTTP Gateway Listen Port"
-              type="number"
-              value={serverPort}
-              onChange={(e) => setServerPort(Number(e.target.value))}
-              fullWidth
-              size="small"
-            />
+    <Box display="flex" flexDirection="column" gap={3}>
+      {/* Engine Gateway Settings */}
+      <Card>
+        <CardContent>
+          <Typography variant="h6" fontWeight={700} mb={2}>
+            Engine Gateway Settings
+          </Typography>
+          
+          <Grid container spacing={3}>
+            <Grid item xs={12} sm={6}>
+              <TextField
+                label="HTTP Gateway Listen Port"
+                type="number"
+                value={serverPort}
+                onChange={(e) => setServerPort(Number(e.target.value))}
+                fullWidth
+                size="small"
+              />
+            </Grid>
+            <Grid item xs={12} sm={6}>
+              <TextField
+                label="Rate Limit per WebRTC channel (MB/s)"
+                type="number"
+                value={bandwidthLimit}
+                onChange={(e) => setBandwidthLimit(Number(e.target.value))}
+                fullWidth
+                size="small"
+              />
+            </Grid>
+            <Grid item xs={12} sm={8}>
+              <TextField
+                label="Forward Target Host (SOCKS5/HTTP Proxy Target)"
+                value={socksHost}
+                onChange={(e) => setSocksHost(e.target.value)}
+                fullWidth
+                size="small"
+              />
+            </Grid>
+            <Grid item xs={12} sm={4}>
+              <TextField
+                label="Target Port"
+                type="number"
+                value={socksPort}
+                onChange={(e) => setSocksPort(Number(e.target.value))}
+                fullWidth
+                size="small"
+              />
+            </Grid>
+
+            <Grid item xs={12}>
+              <Box display="flex" gap={2} mt={1}>
+                <Button
+                  customVariant="primary"
+                  startIcon={<SaveIcon />}
+                  onClick={handleSaveConfig}
+                >
+                  Apply Settings
+                </Button>
+                <Button
+                  customVariant="danger"
+                  startIcon={<ShutdownIcon />}
+                  onClick={handleRestartServer}
+                >
+                  Restart Engine
+                </Button>
+              </Box>
+            </Grid>
           </Grid>
-          <Grid item xs={12} sm={6}>
-            <TextField
-              label="Rate Limit per WebRTC channel (MB/s)"
-              type="number"
-              value={bandwidthLimit}
-              onChange={(e) => setBandwidthLimit(Number(e.target.value))}
-              fullWidth
-              size="small"
-            />
-          </Grid>
-          <Grid item xs={12} sm={8}>
-            <TextField
-              label="Forward Target Host (SOCKS5/HTTP Proxy Target)"
-              value={socksHost}
-              onChange={(e) => setSocksHost(e.target.value)}
-              fullWidth
-              size="small"
-            />
-          </Grid>
-          <Grid item xs={12} sm={4}>
-            <TextField
-              label="Target Port"
-              type="number"
-              value={socksPort}
-              onChange={(e) => setSocksPort(Number(e.target.value))}
-              fullWidth
-              size="small"
-            />
+        </CardContent>
+      </Card>
+
+      {/* Group Bus Configuration — The "Secret Rendezvous Point" */}
+      <Card>
+        <CardContent>
+          <Box display="flex" alignItems="center" gap={1.5} mb={1}>
+            <UsersIcon color="secondary" />
+            <Typography variant="h6" fontWeight={700}>
+              Group Bus Configuration
+            </Typography>
+          </Box>
+          <Typography variant="body2" color="text.secondary" mb={3}>
+            Both the Client and Server must independently know the same Group Chat ID and Pre-Shared Key (PSK).
+            This is the "secret rendezvous point" — configure the exact same values that are set on the client side.
+          </Typography>
+
+          <Divider sx={{ mb: 3 }} />
+
+          {groupSaved && (
+            <Alert severity="success" sx={{ mb: 2, borderRadius: 2 }}>
+              Group bus configuration saved successfully! Ensure the client uses the same Group Chat ID and PSK.
+            </Alert>
+          )}
+
+          <Grid container spacing={3}>
+            <Grid item xs={12} sm={6}>
+              <TextField
+                label="Group Chat ID"
+                placeholder="e.g. -1001234567890"
+                value={groupChatId}
+                onChange={(e) => { setGroupChatId(e.target.value); setGroupSaved(false); }}
+                fullWidth
+                size="small"
+                helperText="The Soroush group chat ID where stealth commands are exchanged."
+                InputProps={{
+                  style: { fontFamily: 'monospace' },
+                }}
+              />
+            </Grid>
+            <Grid item xs={12} sm={6}>
+              <TextField
+                label="Pre-Shared Key (PSK)"
+                placeholder="e.g. my-secret-key-2026"
+                value={groupPsk}
+                onChange={(e) => { setGroupPsk(e.target.value); setGroupSaved(false); }}
+                fullWidth
+                size="small"
+                helperText="Symmetric key used to encode/decode stealth commands in group chat messages."
+                InputProps={{
+                  style: { fontFamily: 'monospace' },
+                }}
+              />
+            </Grid>
+
+            <Grid item xs={12}>
+              <Box display="flex" gap={2} mt={1}>
+                <Button
+                  customVariant="glow"
+                  startIcon={groupSaving ? <CircularProgress size={18} color="inherit" /> : <SaveIcon />}
+                  onClick={handleSaveGroupConfig}
+                  disabled={groupSaving || !groupChatId}
+                >
+                  {groupSaving ? 'Saving...' : 'Save Group Config'}
+                </Button>
+              </Box>
+            </Grid>
           </Grid>
 
-          <Grid item xs={12}>
-            <Box display="flex" gap={2} mt={1}>
-              <Button
-                customVariant="primary"
-                startIcon={<SaveIcon />}
-                onClick={handleSaveConfig}
-              >
-                Apply Settings
-              </Button>
-              <Button
-                customVariant="danger"
-                startIcon={<ShutdownIcon />}
-                onClick={handleRestartServer}
-              >
-                Restart Engine
-              </Button>
-            </Box>
-          </Grid>
-        </Grid>
-      </CardContent>
-    </Card>
+          {/* Visual hint about matching configuration */}
+          <Paper
+            variant="outlined"
+            sx={{
+              mt: 3,
+              p: 2,
+              borderRadius: 2,
+              bgcolor: 'rgba(124, 58, 237, 0.04)',
+              borderColor: 'rgba(124, 58, 237, 0.15)',
+            }}
+          >
+            <Typography variant="caption" color="text.secondary" display="block" mb={0.5} fontWeight={600}>
+              ⚡ How It Works
+            </Typography>
+            <Typography variant="caption" color="text.secondary" display="block">
+              Without a central server, both Client and Server discover each other by monitoring the same Soroush group chat.
+              The client sends a stealth DISCOVER command (encoded with the PSK), and this server responds with an OFFER — 
+              all hidden inside normal-looking group chat messages. Both sides must have identical Group Chat ID and PSK values.
+            </Typography>
+          </Paper>
+        </CardContent>
+      </Card>
+    </Box>
   );
 }
 
