@@ -244,9 +244,9 @@ const (
 	// RPC error
 	IDRPCError uint32 = 0x2144CA19
 
-	// Soroush app credentials
-	SoroushAppID   int32  = 2133480
-	SoroushAppHash string = "7642643a60a7e0892095034c76742512"
+	// Soroush app credentials (extracted from web.splus.ir PWA)
+	SoroushAppID   int32  = 1030400
+	SoroushAppHash string = "6edb16cf88714a4e9a805e928c39c937"
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -293,7 +293,7 @@ func WrapInitConnection(apiID int32, query []byte) []byte {
 
 	w := NewTLWriter()
 	w.WriteUint32(IDInvokeWithLayer)
-	w.WriteInt32(181) // layer
+	w.WriteInt32(182) // layer (Soroush production)
 	w.WriteRaw(init.GetBytes())
 	return w.GetBytes()
 }

@@ -18,11 +18,11 @@ const (
 	// messages.sendMessage — 0x280D096F (TL schema)
 	IDSendMessage uint32 = 0x280D096F
 
-	// messages.getDialogs — 0xA062D3F4
-	IDGetDialogs uint32 = 0xA062D3F4
+	// messages.getDialogs — 0xA0F4CB4F (Soroush layer 182)
+	IDGetDialogs uint32 = 0xA0F4CB4F
 
-	// InputPeerUser — 0x7B8E7DE6
-	IDInputPeerUser uint32 = 0x7B8E7DE6
+	// InputPeerUser — 0xDDE8A54C (Soroush layer 182)
+	IDInputPeerUser uint32 = 0xDDE8A54C
 
 	// InputPeerChat — 0x35A95CB9 (for group chats)
 	IDInputPeerChat uint32 = 0x35A95CB9
@@ -75,8 +75,8 @@ const (
 	// chatForbidden — 0x6592A1A7
 	IDChatForbidden uint32 = 0x6592A1A7
 
-	// channel — 0x0AADFC8F (or 0x94F592DB in some layers)
-	IDChannel uint32 = 0x0AADFC8F
+	// channel — 0x8E87CCD8 (Soroush layer 182)
+	IDChannel uint32 = 0x8E87CCD8
 
 	// channelForbidden — 0x17D493D5
 	IDChannelForbidden uint32 = 0x17D493D5

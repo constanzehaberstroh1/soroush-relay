@@ -413,6 +413,7 @@ func handleFetchGroups(w http.ResponseWriter, r *http.Request) {
 	defer transport.Disconnect()
 
 	body := soroushlib.BuildGetDialogsRequest()
+	wrappedBody := soroushlib.WrapInitConnection(soroushlib.SoroushAppID, body)
 
 	recvCh := make(chan recvResult, 1)
 	go func() {
@@ -420,7 +421,7 @@ func handleFetchGroups(w http.ResponseWriter, r *http.Request) {
 		recvCh <- recvResult{cid: cid, reader: reader, err: err}
 	}()
 
-	msgID, err := session.Send(ctx, body, true)
+	msgID, err := session.Send(ctx, wrappedBody, true)
 	if err != nil {
 		recordSystemLog(fmt.Sprintf("[Groups] Send failed: %v", err), "error")
 		http.Error(w, fmt.Sprintf(`{"error":"Send failed: %s"}`, err.Error()), http.StatusInternalServerError)
@@ -449,7 +450,7 @@ func handleFetchGroups(w http.ResponseWriter, r *http.Request) {
 				cid, reader, err := session.Recv(ctx)
 				recvCh <- recvResult{cid: cid, reader: reader, err: err}
 			}()
-			msgID, _ = session.Send(ctx, body, true)
+			msgID, _ = session.Send(ctx, wrappedBody, true)
 			continue
 		}
 
