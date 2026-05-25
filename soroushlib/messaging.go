@@ -671,7 +671,7 @@ func SendTextMessage(ctx context.Context, session *MTProtoSession, userID int64,
 	randomID := time.Now().UnixNano()
 	body := BuildSendTextMessage(userID, accessHash, text, randomID)
 
-	_, err := session.Send(ctx, body, true)
+	_, _, err := session.SendAndWait(ctx, body, true)
 	if err != nil {
 		return fmt.Errorf("send text message: %w", err)
 	}
@@ -684,7 +684,7 @@ func SendGroupMessage(ctx context.Context, session *MTProtoSession, chatID int64
 	randomID := time.Now().UnixNano()
 	body := BuildSendGroupMessage(chatID, text, randomID)
 
-	_, err := session.Send(ctx, body, true)
+	_, _, err := session.SendAndWait(ctx, body, true)
 	if err != nil {
 		return fmt.Errorf("send group message: %w", err)
 	}
@@ -698,7 +698,7 @@ func SendChannelMessage(ctx context.Context, session *MTProtoSession, chatID int
 	randomID := time.Now().UnixNano()
 	body := BuildSendChannelMessage(chatID, accessHash, text, randomID)
 
-	_, err := session.Send(ctx, body, true)
+	_, _, err := session.SendAndWait(ctx, body, true)
 	if err != nil {
 		return fmt.Errorf("send channel message: %w", err)
 	}

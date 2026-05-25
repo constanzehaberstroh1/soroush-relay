@@ -130,6 +130,85 @@ func (s *MTProtoSession) Send(ctx context.Context, body []byte, contentRelated b
 	return msgID, s.Transport.Send(ctx, packet)
 }
 
+// SendAndWait sends an encrypted message and waits for the RPC response.
+// It automatically handles bad_server_salt by updating the salt and retrying.
+// Returns the response constructor ID and TLReader, or an error.
+func (s *MTProtoSession) SendAndWait(ctx context.Context, body []byte, contentRelated bool) (uint32, *TLReader, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		_, err := s.Send(ctx, body, contentRelated)
+		if err != nil {
+			return 0, nil, fmt.Errorf("send: %w", err)
+		}
+
+		// Read response with timeout
+		recvCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		cid, reader, err := s.Recv(recvCtx)
+		cancel()
+		if err != nil {
+			return 0, nil, fmt.Errorf("recv: %w", err)
+		}
+
+		switch cid {
+		case IDBadServerSalt:
+			// Update salt and retry
+			reader.ReadInt64() // bad_msg_id
+			reader.ReadInt32() // bad_msg_seqno
+			reader.ReadInt32() // error_code
+			newSalt, _ := reader.ReadInt64()
+			s.ServerSalt = newSalt
+			log.Printf("[MTProto] Bad server salt, updated to %d. Retrying (attempt %d)...", newSalt, attempt+1)
+			continue
+
+		case IDNewSession:
+			// Update salt from new session and retry
+			reader.ReadInt64() // first_msg_id
+			reader.ReadInt64() // unique_id
+			newSalt, _ := reader.ReadInt64()
+			s.ServerSalt = newSalt
+			log.Printf("[MTProto] New session, salt=%d. Retrying (attempt %d)...", newSalt, attempt+1)
+			continue
+
+		case IDMsgsAck:
+			// Just an ACK, need to read the actual response
+			recvCtx2, cancel2 := context.WithTimeout(ctx, 10*time.Second)
+			cid2, reader2, err2 := s.Recv(recvCtx2)
+			cancel2()
+			if err2 != nil {
+				return 0, nil, fmt.Errorf("recv after ack: %w", err2)
+			}
+			return cid2, reader2, nil
+
+		case IDMsgContainer:
+			// Parse container to find the actual RPC result
+			count, _ := reader.ReadInt32()
+			for i := int32(0); i < count; i++ {
+				reader.ReadInt64() // msg_id
+				reader.ReadInt32() // seq_no
+				bodyLen, _ := reader.ReadInt32()
+				subBody, _ := reader.ReadRaw(int(bodyLen))
+				if len(subBody) >= 4 {
+					subCID := binary.LittleEndian.Uint32(subBody[:4])
+					if subCID == IDBadServerSalt && len(subBody) >= 28 {
+						newSalt := int64(binary.LittleEndian.Uint64(subBody[20:28]))
+						s.ServerSalt = newSalt
+						log.Printf("[MTProto] Bad salt in container, updated to %d", newSalt)
+						break // will retry in outer loop
+					}
+					if subCID == IDRPCResult || subCID == IDUpdates || subCID == IDUpdateShortSentMessage {
+						subReader := NewTLReader(subBody[4:])
+						return subCID, subReader, nil
+					}
+				}
+			}
+			continue // retry if only salt updates in container
+
+		default:
+			return cid, reader, nil
+		}
+	}
+	return 0, nil, fmt.Errorf("SendAndWait: failed after 3 retries (bad_server_salt)")
+}
+
 // Recv receives and decrypts an MTProto message.
 // Returns (constructor_id, TLReader, error)
 func (s *MTProtoSession) Recv(ctx context.Context) (uint32, *TLReader, error) {
