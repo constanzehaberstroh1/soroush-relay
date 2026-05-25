@@ -386,7 +386,7 @@ func testSoroushWebFrontend() InfraTestResult {
 func testAccountsHealth() InfraTestResult {
 	result := InfraTestResult{
 		Name:        "Account Pool Health",
-		Description: "Check registered accounts, roles, and session keys",
+		Description: "Check registered accounts, session keys, and group bus readiness",
 		Category:    "auth",
 	}
 
@@ -409,33 +409,45 @@ func testAccountsHealth() InfraTestResult {
 		return result
 	}
 
-	dispatchers := 0
-	workers := 0
 	withAuthKey := 0
+	connected := 0
 	for _, acc := range accounts {
-		if acc.Role == "dispatcher" {
-			dispatchers++
-		}
-		if acc.Role == "worker" {
-			workers++
-		}
 		if len(acc.AuthKey) > 0 {
 			withAuthKey++
 		}
+		if acc.Status == "connected" && len(acc.AuthKey) > 0 {
+			connected++
+		}
 	}
 
-	if dispatchers == 0 {
+	if withAuthKey == 0 {
 		result.Status = "warn"
-		result.Detail = fmt.Sprintf("%d accounts (%d with auth keys) but no dispatcher assigned", len(accounts), withAuthKey)
+		result.Detail = fmt.Sprintf("%d accounts but none have valid auth keys. Re-authenticate via OTP.", len(accounts))
 		return result
 	}
-	if workers == 0 {
+
+	// Check if group bus is configured
+	var groupCfg DBGroupConfig
+	db.First(&groupCfg)
+
+	if groupCfg.GroupChatID == 0 {
 		result.Status = "warn"
-		result.Detail = fmt.Sprintf("%d accounts, %d dispatcher(s) but no workers assigned", len(accounts), dispatchers)
+		result.Detail = fmt.Sprintf("%d accounts (%d connected) but no Group Chat ID configured.", len(accounts), connected)
+		return result
+	}
+
+	// Check if tunnel engine is running
+	serverTunnel.mu.Lock()
+	engineRunning := serverTunnel.running
+	serverTunnel.mu.Unlock()
+
+	if !engineRunning {
+		result.Status = "warn"
+		result.Detail = fmt.Sprintf("%d accounts (%d connected), group configured (ID=%d) but tunnel engine not started.", len(accounts), connected, groupCfg.GroupChatID)
 		return result
 	}
 
 	result.Status = "pass"
-	result.Detail = fmt.Sprintf("%d accounts: %d dispatcher(s), %d worker(s), %d with auth keys", len(accounts), dispatchers, workers, withAuthKey)
+	result.Detail = fmt.Sprintf("%d accounts (%d connected), group bus active on chat %d ✅", len(accounts), connected, groupCfg.GroupChatID)
 	return result
 }
