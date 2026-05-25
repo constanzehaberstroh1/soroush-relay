@@ -760,3 +760,60 @@ func handleGroupConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"Method not allowed"}`, http.StatusMethodNotAllowed)
 	}
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tunnel Engine HTTP API — Start / Stop / Status
+// ──────────────────────────────────────────────────────────────────────────────
+
+func handleServerTunnelStart(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := startServerTunnel(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusBadRequest)
+		return
+	}
+
+	addLog("Tunnel engine started — listening for DISCOVER messages", "success")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"running": true,
+	})
+}
+
+func handleServerTunnelStop(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	stopServerTunnel()
+
+	addLog("Tunnel engine stopped", "warn")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"running": false,
+	})
+}
+
+func handleServerTunnelStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	serverTunnel.mu.Lock()
+	running := serverTunnel.running
+	ready := serverTunnel.dispatcherReady
+	workers := len(serverTunnel.activeWorkers)
+	chatID := serverTunnel.groupChatID
+	serverTunnel.mu.Unlock()
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"running":    running,
+		"ready":      ready,
+		"workers":    workers,
+		"groupChatId": chatID,
+	})
+}

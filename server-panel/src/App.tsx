@@ -707,6 +707,11 @@ function ConfigView() {
   const [groupPickerSearch, setGroupPickerSearch] = useState('');
   const [groupList, setGroupList] = useState<{ id: number; title: string; type: string; membersCount: number; accessHash: number }[]>([]);
 
+  // Tunnel Engine state
+  const [engineRunning, setEngineRunning] = useState(false);
+  const [engineStarting, setEngineStarting] = useState(false);
+  const [engineError, setEngineError] = useState('');
+
   const fetchConfig = async () => {
     try {
       const res = await fetch(`${API_BASE}/config`, { headers: getHeaders() });
@@ -737,6 +742,17 @@ function ConfigView() {
       } catch { /* ignore */ }
     };
     loadGroupConfig();
+    // Load tunnel engine status
+    const loadEngineStatus = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/tunnel/status`, { headers: getHeaders() });
+        if (res.ok) {
+          const data = await res.json();
+          setEngineRunning(data.running || false);
+        }
+      } catch { /* ignore */ }
+    };
+    loadEngineStatus();
   }, []);
 
   const handleSaveConfig = async () => {
@@ -978,6 +994,69 @@ function ConfigView() {
               all hidden inside normal-looking group chat messages. Both sides must have identical Group Chat ID and PSK values.
             </Typography>
           </Paper>
+        </CardContent>
+      </Card>
+
+      {/* Tunnel Engine Control */}
+      <Card>
+        <CardContent>
+          <Box display="flex" alignItems="center" gap={1.5} mb={1}>
+            <Box sx={{
+              width: 10, height: 10, borderRadius: '50%',
+              bgcolor: engineRunning ? '#10b981' : 'rgba(255,255,255,0.2)',
+              boxShadow: engineRunning ? '0 0 8px rgba(16, 185, 129, 0.5)' : 'none',
+              animation: engineRunning ? 'pulse 2s infinite' : 'none',
+            }} />
+            <Typography variant="h6" fontWeight={700}>
+              Tunnel Engine
+            </Typography>
+            <Badge
+              label={engineRunning ? 'RUNNING' : 'STOPPED'}
+              customVariant={engineRunning ? 'online' : 'error'}
+            />
+          </Box>
+          <Typography variant="body2" color="text.secondary" mb={2}>
+            The tunnel engine connects to Soroush and listens for client DISCOVER messages in the group chat.
+            It must be running for clients to find and connect to this server.
+          </Typography>
+
+          {engineError && (
+            <Alert severity="error" sx={{ mb: 2, borderRadius: 2 }}>
+              {engineError}
+            </Alert>
+          )}
+
+          <Box display="flex" gap={2}>
+            <Button
+              customVariant={engineRunning ? 'secondary' : 'primary'}
+              startIcon={engineStarting ? <CircularProgress size={18} color="inherit" /> : (engineRunning ? <ShutdownIcon /> : <PlayArrowIcon />)}
+              onClick={async () => {
+                setEngineStarting(true);
+                setEngineError('');
+                try {
+                  const endpoint = engineRunning ? 'tunnel/stop' : 'tunnel/start';
+                  const res = await fetch(`${API_BASE}/${endpoint}`, {
+                    method: 'POST',
+                    headers: getHeaders(),
+                  });
+                  if (res.ok) {
+                    setEngineRunning(!engineRunning);
+                  } else {
+                    const data = await res.json();
+                    setEngineError(data.error || 'Failed to toggle engine.');
+                  }
+                } catch {
+                  setEngineError('Connection error.');
+                } finally {
+                  setEngineStarting(false);
+                }
+              }}
+              disabled={engineStarting}
+              sx={{ minWidth: 180 }}
+            >
+              {engineStarting ? 'Working...' : engineRunning ? 'Stop Engine' : 'Start Engine'}
+            </Button>
+          </Box>
         </CardContent>
       </Card>
       {/* Group Picker Modal */}
