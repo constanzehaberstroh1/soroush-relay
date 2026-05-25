@@ -122,12 +122,10 @@ func BuildGetDialogsRequest() []byte {
 }
 
 // ParseDialogsForGroups extracts group chats from a messages.getDialogs response.
-// Instead of trying to skip the dialogs and messages vectors field-by-field (which
-// is fragile and easily desynchronizes), we scan the raw response bytes for vector
-// constructor markers (0x1CB5C415). The response layout is:
-//   messages.dialogs:      [dialogs_vec] [messages_vec] [chats_vec] [users_vec]
-//   messages.dialogsSlice: count [dialogs_vec] [messages_vec] [chats_vec] [users_vec]
-// We want the 3rd vector (chats_vec).
+// The response contains multiple vectors (dialogs, messages, chats, users), but
+// message objects can also contain nested vectors (entities, reactions, etc.).
+// So we can't simply count vector markers — instead we find the vector whose
+// first element is a chat/channel constructor.
 func ParseDialogsForGroups(cid uint32, r *TLReader) ([]DialogInfo, error) {
 	if cid == IDRPCError {
 		return nil, ParseRPCError(r)
@@ -152,41 +150,60 @@ func ParseDialogsForGroups(cid uint32, r *TLReader) ([]DialogInfo, error) {
 		offset = 4
 	}
 
-	// Scan for vector constructor markers (0x1CB5C415) in remaining bytes
-	vectorCID := [4]byte{0x15, 0xC4, 0xB5, 0x1C} // little-endian 0x1CB5C415
-	var vectorPositions []int
-	for i := offset; i+4 <= len(raw); i += 4 { // TL is 4-byte aligned
+	// Chat/channel constructor IDs that indicate a chats vector
+	chatCIDs := map[uint32]bool{
+		IDChat: true, IDChannel: true,
+		IDChatForbidden: true, IDChannelForbidden: true,
+		0x29562865: true, // chatEmpty
+	}
+
+	// Scan for vector constructor markers (0x1CB5C415) and find the one
+	// whose first element is a chat/channel constructor
+	vectorCID := [4]byte{0x15, 0xC4, 0xB5, 0x1C}
+	chatsStart := -1
+	chatsEnd := len(raw)
+	nextVecAfterChats := -1
+
+	var allVecPositions []int
+	for i := offset; i+4 <= len(raw); i += 4 {
 		if raw[i] == vectorCID[0] && raw[i+1] == vectorCID[1] &&
 			raw[i+2] == vectorCID[2] && raw[i+3] == vectorCID[3] {
-			vectorPositions = append(vectorPositions, i)
+			allVecPositions = append(allVecPositions, i)
+
+			// Check: vec_cid(4) + count(4) + first_element_cid(4) = need 12 bytes
+			if i+12 <= len(raw) {
+				elemCount := int32(binary.LittleEndian.Uint32(raw[i+4 : i+8]))
+				if elemCount > 0 {
+					firstElemCID := binary.LittleEndian.Uint32(raw[i+8 : i+12])
+					if chatCIDs[firstElemCID] {
+						chatsStart = i
+						log.Printf("[Dialogs] Found chats vector at offset %d (count=%d, firstCID=0x%08X)", i, elemCount, firstElemCID)
+					}
+				}
+			}
+
+			// Track the vector right after the chats vector
+			if chatsStart >= 0 && nextVecAfterChats < 0 && i > chatsStart {
+				nextVecAfterChats = i
+				chatsEnd = i
+			}
 		}
 	}
 
-	log.Printf("[Dialogs] Found %d vector markers at positions: %v", len(vectorPositions), vectorPositions)
+	log.Printf("[Dialogs] Found %d vector markers at positions: %v", len(allVecPositions), allVecPositions)
 
-	if len(vectorPositions) < 3 {
-		// Fallback: if we can't find 3 vectors, try to parse any chats we can find
-		log.Printf("[Dialogs] WARNING: Expected at least 3 vectors (dialogs, messages, chats), got %d", len(vectorPositions))
+	if chatsStart < 0 {
+		// No vector starts with a chat constructor — fall back to scanning entire payload
+		log.Printf("[Dialogs] WARNING: No chats vector found by constructor check, scanning entire payload")
 		return scanForChatsInRaw(raw[offset:]), nil
 	}
 
-	// The 3rd vector (index 2) is the chats vector
-	// Limit the scan range to between chats vector and users vector (or end of data)
-	chatsStart := vectorPositions[2]
-	chatsEnd := len(raw)
-	if len(vectorPositions) >= 4 {
-		chatsEnd = vectorPositions[3]
-	}
 	chatsSlice := raw[chatsStart:chatsEnd]
-
-	// Read the vector count for logging
 	if len(chatsSlice) >= 8 {
 		vecCount := int32(binary.LittleEndian.Uint32(chatsSlice[4:8]))
 		log.Printf("[Dialogs] Chats vector declares %d entries, scanning %d bytes", vecCount, len(chatsSlice))
 	}
 
-	// Use raw scanning instead of sequential parsing — much more robust
-	// because we don't need to fully consume each chat object's fields
 	groups := scanForChatsInRaw(chatsSlice)
 	log.Printf("[Dialogs] Found %d groups/channels from chats vector", len(groups))
 
