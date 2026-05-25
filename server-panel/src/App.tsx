@@ -985,37 +985,48 @@ function ConfigView() {
         PaperProps={{
           sx: {
             bgcolor: '#0f172a',
-            border: '1px solid rgba(255,255,255,0.08)',
+            border: '1px solid rgba(255,255,255,0.1)',
             borderRadius: 3,
+            overflow: 'hidden',
           }
         }}
       >
-        <DialogTitle fontWeight={800} sx={{ pb: 1 }}>
-          <Box display="flex" alignItems="center" gap={1}>
-            <UsersIcon color="primary" />
-            Select Group Chat
+        <DialogTitle sx={{ pb: 1, pt: 2.5, px: 3 }}>
+          <Box display="flex" alignItems="center" gap={1.5}>
+            <Box sx={{
+              width: 40, height: 40, borderRadius: 2,
+              bgcolor: 'rgba(139, 92, 246, 0.15)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}>
+              <UsersIcon sx={{ color: '#a78bfa', fontSize: 22 }} />
+            </Box>
+            <Box>
+              <Typography variant="h6" fontWeight={700} sx={{ lineHeight: 1.3 }}>
+                Select Group Chat
+              </Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.25 }}>
+                Choose a group from your account's chat list
+              </Typography>
+            </Box>
           </Box>
-          <Typography variant="caption" color="text.secondary" display="block" mt={0.5}>
-            Choose a Soroush group from your account's chat list. The group ID will be auto-filled.
-          </Typography>
         </DialogTitle>
-        <DialogContent>
+        <DialogContent sx={{ px: 3, pb: 2 }}>
           {groupPickerLoading ? (
             <Box display="flex" flexDirection="column" alignItems="center" py={6} gap={2}>
-              <CircularProgress size={36} />
-              <Typography variant="body2" color="text.secondary">
+              <CircularProgress size={40} />
+              <Typography variant="body1" color="text.secondary">
                 Connecting to Soroush and fetching groups...
               </Typography>
             </Box>
           ) : groupPickerError ? (
-            <Alert severity="error" sx={{ borderRadius: 2 }}>
+            <Alert severity="error" sx={{ borderRadius: 2, fontSize: '0.95rem' }}>
               {groupPickerError}
             </Alert>
           ) : (
             <>
               <TextField
                 label="Search groups..."
-                placeholder="Filter by name..."
+                placeholder="Filter by name or ID..."
                 value={groupPickerSearch}
                 onChange={(e) => setGroupPickerSearch(e.target.value)}
                 fullWidth
@@ -1023,16 +1034,17 @@ function ConfigView() {
                 sx={{ mb: 2 }}
               />
               <Box sx={{
-                maxHeight: 380,
+                maxHeight: 400,
                 overflowY: 'auto',
                 display: 'flex',
                 flexDirection: 'column',
-                gap: 1,
+                gap: 1.5,
                 '&::-webkit-scrollbar': { width: '6px' },
-                '&::-webkit-scrollbar-thumb': { bgcolor: 'rgba(255,255,255,0.1)', borderRadius: '3px' },
+                '&::-webkit-scrollbar-thumb': { bgcolor: 'rgba(255,255,255,0.12)', borderRadius: '3px' },
               }}>
                 {groupList
-                  .filter(g => g.title.toLowerCase().includes(groupPickerSearch.toLowerCase()))
+                  .filter(g => g.title.toLowerCase().includes(groupPickerSearch.toLowerCase()) ||
+                               String(g.id).includes(groupPickerSearch))
                   .map((group) => (
                   <Paper
                     key={group.id}
@@ -1042,64 +1054,81 @@ function ConfigView() {
                       p: 2,
                       cursor: 'pointer',
                       bgcolor: 'rgba(255,255,255,0.02)',
-                      border: '1px solid rgba(255,255,255,0.06)',
-                      borderRadius: 2,
+                      border: '1px solid rgba(255,255,255,0.08)',
+                      borderRadius: 2.5,
                       transition: 'all 0.2s ease',
                       '&:hover': {
-                        bgcolor: 'rgba(139, 92, 246, 0.08)',
-                        borderColor: 'rgba(139, 92, 246, 0.3)',
+                        bgcolor: 'rgba(139, 92, 246, 0.1)',
+                        borderColor: 'rgba(139, 92, 246, 0.4)',
                         transform: 'translateX(4px)',
+                        boxShadow: '0 0 20px rgba(139, 92, 246, 0.08)',
                       },
                     }}
                   >
-                    <Box display="flex" alignItems="center" justifyContent="space-between">
-                      <Box display="flex" alignItems="center" gap={1.5}>
-                        <Box
+                    <Box display="flex" alignItems="center" gap={2}>
+                      <Box
+                        sx={{
+                          width: 44,
+                          height: 44,
+                          borderRadius: 2.5,
+                          bgcolor: group.type === 'group' ? 'rgba(16, 185, 129, 0.15)' :
+                                   group.type === 'supergroup' ? 'rgba(139, 92, 246, 0.15)' :
+                                   'rgba(59, 130, 246, 0.15)',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          flexShrink: 0,
+                        }}
+                      >
+                        <UsersIcon sx={{
+                          fontSize: 22,
+                          color: group.type === 'group' ? '#10b981' :
+                                 group.type === 'supergroup' ? '#a78bfa' : '#3b82f6'
+                        }} />
+                      </Box>
+                      <Box flex={1} minWidth={0}>
+                        <Typography
+                          variant="body1"
+                          fontWeight={600}
                           sx={{
-                            width: 36,
-                            height: 36,
-                            borderRadius: 2,
-                            bgcolor: group.type === 'group' ? 'rgba(16, 185, 129, 0.15)' :
-                                     group.type === 'supergroup' ? 'rgba(139, 92, 246, 0.15)' :
-                                     'rgba(59, 130, 246, 0.15)',
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                            flexShrink: 0,
+                            fontSize: '1rem',
+                            lineHeight: 1.3,
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap',
                           }}
                         >
-                          <UsersIcon sx={{
-                            fontSize: 18,
-                            color: group.type === 'group' ? '#10b981' :
-                                   group.type === 'supergroup' ? '#a78bfa' : '#3b82f6'
-                          }} />
-                        </Box>
-                        <Box>
-                          <Typography variant="body2" fontWeight={600}>
-                            {group.title}
+                          {group.title}
+                        </Typography>
+                        <Box display="flex" alignItems="center" gap={1} mt={0.5}>
+                          <Badge
+                            label={group.type}
+                            customVariant={group.type === 'group' ? 'online' : 'idle'}
+                          />
+                          <Typography variant="body2" color="text.secondary" sx={{ fontFamily: 'monospace', fontSize: '0.8rem' }}>
+                            ID: {group.id}
                           </Typography>
-                          <Box display="flex" alignItems="center" gap={1}>
-                            <Badge
-                              label={group.type}
-                              customVariant={group.type === 'group' ? 'online' : 'idle'}
-                            />
-                            <Typography variant="caption" color="text.secondary" sx={{ fontFamily: 'monospace' }}>
-                              ID: {group.id}
+                          {group.membersCount > 0 && (
+                            <Typography variant="body2" color="text.secondary" sx={{ fontSize: '0.8rem' }}>
+                              · {group.membersCount} members
                             </Typography>
-                            {group.membersCount > 0 && (
-                              <Typography variant="caption" color="text.secondary">
-                                · {group.membersCount} members
-                              </Typography>
-                            )}
-                          </Box>
+                          )}
                         </Box>
+                      </Box>
+                      <Box sx={{
+                        color: 'rgba(255,255,255,0.2)',
+                        fontSize: '1.5rem',
+                        transition: 'all 0.2s',
+                        '.MuiPaper-root:hover &': { color: '#a78bfa', transform: 'translateX(2px)' },
+                      }}>
+                        ›
                       </Box>
                     </Box>
                   </Paper>
                 ))}
                 {groupList.filter(g => g.title.toLowerCase().includes(groupPickerSearch.toLowerCase())).length === 0 && (
                   <Box py={4} textAlign="center">
-                    <Typography variant="body2" color="text.secondary">
+                    <Typography variant="body1" color="text.secondary">
                       {groupList.length === 0 ? 'No groups found in this account.' : 'No groups match your search.'}
                     </Typography>
                   </Box>
@@ -1108,7 +1137,7 @@ function ConfigView() {
             </>
           )}
         </DialogContent>
-        <DialogActions sx={{ p: 2, pt: 0 }}>
+        <DialogActions sx={{ p: 2.5, pt: 1, borderTop: '1px solid rgba(255,255,255,0.06)' }}>
           <Button customVariant="secondary" onClick={() => setGroupPickerOpen(false)}>
             Cancel
           </Button>
