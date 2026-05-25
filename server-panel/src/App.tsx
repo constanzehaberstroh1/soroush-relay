@@ -1012,7 +1012,7 @@ function ConfigView() {
             </Typography>
             <Badge
               label={engineRunning ? 'RUNNING' : 'STOPPED'}
-              customVariant={engineRunning ? 'online' : 'error'}
+              customVariant={engineRunning ? 'online' : 'offline'}
             />
           </Box>
           <Typography variant="body2" color="text.secondary" mb={2}>
