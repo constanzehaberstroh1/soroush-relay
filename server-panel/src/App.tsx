@@ -695,6 +695,7 @@ function ConfigView() {
 
   // Group Bus Configuration state
   const [groupChatId, setGroupChatId] = useState<string>('');
+  const [groupAccessHash, setGroupAccessHash] = useState<number>(0);
   const [groupPsk, setGroupPsk] = useState<string>('');
   const [groupSaving, setGroupSaving] = useState(false);
   const [groupSaved, setGroupSaved] = useState(false);
@@ -704,7 +705,7 @@ function ConfigView() {
   const [groupPickerLoading, setGroupPickerLoading] = useState(false);
   const [groupPickerError, setGroupPickerError] = useState('');
   const [groupPickerSearch, setGroupPickerSearch] = useState('');
-  const [groupList, setGroupList] = useState<{ id: number; title: string; type: string; membersCount: number }[]>([]);
+  const [groupList, setGroupList] = useState<{ id: number; title: string; type: string; membersCount: number; accessHash: number }[]>([]);
 
   const fetchConfig = async () => {
     try {
@@ -730,6 +731,7 @@ function ConfigView() {
         if (res.ok) {
           const data = await res.json();
           if (data.groupChatId) setGroupChatId(String(data.groupChatId));
+          if (data.groupAccessHash) setGroupAccessHash(data.groupAccessHash);
           if (data.psk) setGroupPsk(data.psk);
         }
       } catch { /* ignore */ }
@@ -766,6 +768,7 @@ function ConfigView() {
         headers: getHeaders(),
         body: JSON.stringify({
           groupChatId: Number(groupChatId),
+          groupAccessHash: groupAccessHash,
           psk: groupPsk,
         }),
       });
@@ -799,8 +802,9 @@ function ConfigView() {
     }
   };
 
-  const handleSelectGroup = (group: { id: number; title: string }) => {
+  const handleSelectGroup = (group: { id: number; title: string; accessHash?: number }) => {
     setGroupChatId(String(group.id));
+    setGroupAccessHash(group.accessHash || 0);
     setGroupSaved(false);
     setGroupPickerOpen(false);
   };

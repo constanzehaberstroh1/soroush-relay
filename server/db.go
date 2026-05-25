@@ -43,9 +43,10 @@ type DBSoroushAccount struct {
 
 // DBGroupConfig stores the group bus configuration for the server
 type DBGroupConfig struct {
-	ID          uint   `gorm:"primaryKey" json:"id"`
-	GroupChatID int64  `json:"groupChatId"`  // "My lovely family" group chat ID
-	PSK         string `gorm:"size:191" json:"psk"` // Pre-shared key for stealth encoding
+	ID              uint   `gorm:"primaryKey" json:"id"`
+	GroupChatID     int64  `json:"groupChatId"`     // "My lovely family" group chat ID
+	GroupAccessHash int64  `json:"groupAccessHash"` // Access hash for channel/supergroup
+	PSK             string `gorm:"size:191" json:"psk"` // Pre-shared key for stealth encoding
 }
 
 // Initialize MySQL database for server exit node (with fallback configurations)

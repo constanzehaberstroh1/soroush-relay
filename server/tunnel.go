@@ -27,6 +27,7 @@ type ServerTunnelEngine struct {
 	activeWorkers   map[string]*WorkerConnection // keyed by account ID
 	dispatcherReady bool
 	groupChatID     int64
+	groupAccessHash int64
 	psk             []byte
 }
 
@@ -68,6 +69,7 @@ func startServerTunnel() error {
 	serverTunnel.cancel = cancel
 	serverTunnel.running = true
 	serverTunnel.groupChatID = groupCfg.GroupChatID
+	serverTunnel.groupAccessHash = groupCfg.GroupAccessHash
 	if groupCfg.PSK != "" {
 		serverTunnel.psk = []byte(groupCfg.PSK)
 	} else {
@@ -142,12 +144,13 @@ func runGroupObserver(ctx context.Context) {
 	serverTunnel.mu.Unlock()
 
 	chatID := serverTunnel.groupChatID
+	chatAH := serverTunnel.groupAccessHash
 	psk := serverTunnel.psk
 	serverID := account.ID
 
 	// Send initial heartbeat
 	hb := soroushlib.NewHeartbeat(serverID, account.SoroushUserID, account.AccessHash, 0)
-	if err := soroushlib.SendGroupCommand(ctx, session, chatID, hb, psk); err != nil {
+	if err := soroushlib.SendGroupCommand(ctx, session, chatID, hb, psk, chatAH); err != nil {
 		recordSystemLog(fmt.Sprintf("[GroupObserver] Initial heartbeat failed: %v", err), "warn")
 	}
 
@@ -198,7 +201,7 @@ func runGroupObserver(ctx context.Context) {
 					offer := soroushlib.NewOffer(targetCID, serverID, account.SoroushUserID, account.AccessHash)
 					offerCtx, offerCancel := context.WithTimeout(ctx, 10*time.Second)
 					defer offerCancel()
-					if err := soroushlib.SendGroupCommand(offerCtx, session, chatID, offer, psk); err != nil {
+					if err := soroushlib.SendGroupCommand(offerCtx, session, chatID, offer, psk, chatAH); err != nil {
 						recordSystemLog(fmt.Sprintf("[GroupObserver] Failed to send OFFER: %v", err), "error")
 					} else {
 						recordSystemLog(fmt.Sprintf("[GroupObserver] Sent OFFER to client %s", targetCID), "success")
@@ -226,7 +229,7 @@ func runGroupObserver(ctx context.Context) {
 		case <-heartbeatTicker.C:
 			hb := soroushlib.NewHeartbeat(serverID, account.SoroushUserID, account.AccessHash, len(serverTunnel.activeWorkers))
 			hbCtx, hbCancel := context.WithTimeout(ctx, 10*time.Second)
-			soroushlib.SendGroupCommand(hbCtx, session, chatID, hb, psk)
+			soroushlib.SendGroupCommand(hbCtx, session, chatID, hb, psk, chatAH)
 			hbCancel()
 
 			// Prune stale repliedDiscovers entries (older than 5 minutes)
@@ -729,8 +732,9 @@ func handleGroupConfig(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPost:
 		var req struct {
-			GroupChatID int64  `json:"groupChatId"`
-			PSK        string `json:"psk"`
+			GroupChatID     int64  `json:"groupChatId"`
+			GroupAccessHash int64  `json:"groupAccessHash"`
+			PSK             string `json:"psk"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, `{"error":"Invalid request"}`, http.StatusBadRequest)
@@ -740,6 +744,7 @@ func handleGroupConfig(w http.ResponseWriter, r *http.Request) {
 		var cfg DBGroupConfig
 		db.FirstOrCreate(&cfg)
 		cfg.GroupChatID = req.GroupChatID
+		cfg.GroupAccessHash = req.GroupAccessHash
 		if req.PSK != "" {
 			cfg.PSK = req.PSK
 		}
@@ -748,7 +753,7 @@ func handleGroupConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		addLog(fmt.Sprintf("Group config updated: ChatID=%d", cfg.GroupChatID), "success")
+		addLog(fmt.Sprintf("Group config updated: ChatID=%d AccessHash=%d", cfg.GroupChatID, cfg.GroupAccessHash), "success")
 		json.NewEncoder(w).Encode(cfg)
 
 	default:

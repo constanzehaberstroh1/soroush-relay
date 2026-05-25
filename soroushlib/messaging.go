@@ -69,6 +69,12 @@ const (
 	// PeerChannel — 0xA2A5371E
 	IDPeerChannel uint32 = 0xA2A5371E
 
+	// InputPeerChannel — 0x27BCBBFC (for sending to channels/supergroups)
+	IDInputPeerChannel uint32 = 0x27BCBBFC
+
+	// updateNewChannelMessage — 0x62BA04D9
+	IDUpdateNewChannelMessage uint32 = 0x62BA04D9
+
 	// chat — 0x41CBF256
 	IDChat uint32 = 0x41CBF256
 
@@ -92,6 +98,7 @@ type DialogInfo struct {
 	Title        string `json:"title"`
 	Type         string `json:"type"` // "group", "channel", "supergroup"
 	MembersCount int32  `json:"membersCount"`
+	AccessHash   int64  `json:"accessHash"`
 }
 
 // BuildGetDialogsRequest builds a messages.getDialogs request
@@ -231,7 +238,7 @@ func scanForChatsInRaw(raw []byte) []DialogInfo {
 			info := parseChannelObject(subReader, cid)
 			if info != nil {
 				groups = append(groups, *info)
-				log.Printf("[Dialogs] Found channel: id=%d title=%q type=%s", info.ID, info.Title, info.Type)
+				log.Printf("[Dialogs] Found channel: id=%d title=%q type=%s ah=%d", info.ID, info.Title, info.Type, info.AccessHash)
 			}
 		case IDChatForbidden:
 			subReader := NewTLReader(raw[i+4:])
@@ -364,8 +371,9 @@ func parseChannelObject(r *TLReader, cid uint32) *DialogInfo {
 	id, _ := r.ReadInt64()
 
 	// access_hash (if flags bit 13)
+	var accessHash int64
 	if flags&(1<<13) != 0 {
-		r.ReadInt64()
+		accessHash, _ = r.ReadInt64()
 	}
 
 	title, _ := r.ReadString()
@@ -381,9 +389,10 @@ func parseChannelObject(r *TLReader, cid uint32) *DialogInfo {
 	}
 
 	return &DialogInfo{
-		ID:    id,
-		Title: title,
-		Type:  chatType,
+		ID:         id,
+		Title:      title,
+		Type:       chatType,
+		AccessHash: accessHash,
 	}
 }
 
@@ -416,19 +425,33 @@ func BuildSendTextMessage(userID int64, accessHash int64, text string, randomID 
 	return w.GetBytes()
 }
 
-// BuildSendGroupMessage builds a messages.sendMessage request to a group chat
+// BuildSendGroupMessage builds a messages.sendMessage request to a group/channel chat
+// For channels/supergroups, we must use InputPeerChannel with access_hash.
 // chatID: the Soroush group chat ID
+// accessHash: the channel's access_hash (0 for regular chats)
 // text: message body
 func BuildSendGroupMessage(chatID int64, text string, randomID int64) []byte {
+	return BuildSendChannelMessage(chatID, 0, text, randomID)
+}
+
+// BuildSendChannelMessage builds a messages.sendMessage to a channel/supergroup
+func BuildSendChannelMessage(chatID int64, accessHash int64, text string, randomID int64) []byte {
 	w := NewTLWriter()
 	w.WriteUint32(IDSendMessage)
 
 	// flags = 0
 	w.WriteInt32(0)
 
-	// peer = InputPeerChat(chat_id)
-	w.WriteUint32(IDInputPeerChat)
-	w.WriteInt64(chatID)
+	if accessHash != 0 {
+		// peer = InputPeerChannel(channel_id, access_hash)
+		w.WriteUint32(IDInputPeerChannel)
+		w.WriteInt64(chatID)
+		w.WriteInt64(accessHash)
+	} else {
+		// peer = InputPeerChat(chat_id) — fallback for regular groups
+		w.WriteUint32(IDInputPeerChat)
+		w.WriteInt64(chatID)
+	}
 
 	// message text
 	w.WriteString(text)
@@ -548,7 +571,7 @@ func processUpdate(cid uint32, r *TLReader, session *MTProtoSession, handler fun
 	case IDUpdateShort:
 		// Single update wrapper
 		innerCID, _ := r.ReadUint32()
-		if innerCID == IDUpdateNewMessage {
+		if innerCID == IDUpdateNewMessage || innerCID == IDUpdateNewChannelMessage {
 			parseUpdateNewMessage(r, handler)
 		}
 		return
@@ -593,12 +616,15 @@ func parseUpdateNewMessage(r *TLReader, handler func(msg IncomingMessage)) {
 		fromUserID, _ = r.ReadInt64()
 	}
 
-	// peer_id — can be PeerUser or PeerChat (group)
+	// peer_id — can be PeerUser, PeerChat (group), or PeerChannel (supergroup)
 	var chatID int64
 	var isGroup bool
 	peerCID, _ := r.ReadUint32()
 	switch peerCID {
 	case IDPeerChat:
+		chatID, _ = r.ReadInt64()
+		isGroup = true
+	case IDPeerChannel:
 		chatID, _ = r.ReadInt64()
 		isGroup = true
 	case IDPeerUser:
@@ -629,7 +655,7 @@ func parseUpdates(r *TLReader, handler func(msg IncomingMessage)) {
 	count, _ := r.ReadInt32()
 	for i := int32(0); i < count; i++ {
 		updateCID, _ := r.ReadUint32()
-		if updateCID == IDUpdateNewMessage {
+		if updateCID == IDUpdateNewMessage || updateCID == IDUpdateNewChannelMessage {
 			parseUpdateNewMessage(r, handler)
 		}
 		// Skip other update types gracefully
@@ -663,6 +689,20 @@ func SendGroupMessage(ctx context.Context, session *MTProtoSession, chatID int64
 		return fmt.Errorf("send group message: %w", err)
 	}
 	log.Printf("[Messaging] Sent group message to chat %d: %s", chatID, truncate(text, 50))
+	return nil
+}
+
+// SendChannelMessage sends a text message to a Soroush channel/supergroup via MTProto
+// Uses InputPeerChannel with access_hash when accessHash is non-zero
+func SendChannelMessage(ctx context.Context, session *MTProtoSession, chatID int64, accessHash int64, text string) error {
+	randomID := time.Now().UnixNano()
+	body := BuildSendChannelMessage(chatID, accessHash, text, randomID)
+
+	_, err := session.Send(ctx, body, true)
+	if err != nil {
+		return fmt.Errorf("send channel message: %w", err)
+	}
+	log.Printf("[Messaging] Sent channel message to chat %d (ah=%d): %s", chatID, accessHash, truncate(text, 50))
 	return nil
 }
 

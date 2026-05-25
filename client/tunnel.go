@@ -192,7 +192,7 @@ func runTunnelFlow(ctx context.Context, cancel context.CancelFunc) {
 		recordSystemLog("[Tunnel] Broadcasting DISCOVER to group...", "info")
 		discover := soroushlib.NewDiscover(clientID)
 		discCtx, discCancel := context.WithTimeout(ctx, 10*time.Second)
-		if err := soroushlib.SendGroupCommand(discCtx, session, config.GroupChatID, discover, psk); err != nil {
+		if err := soroushlib.SendGroupCommand(discCtx, session, config.GroupChatID, discover, psk, config.GroupAccessHash); err != nil {
 			discCancel()
 			setTunnelError(fmt.Sprintf("DISCOVER failed: %v", err))
 			return
@@ -239,7 +239,7 @@ func runTunnelFlow(ctx context.Context, cancel context.CancelFunc) {
 		// Send CALLING to group to lock this server
 		calling := soroushlib.NewCalling(clientID, offer.SID)
 		callCtx2, callCancel2 := context.WithTimeout(ctx, 10*time.Second)
-		soroushlib.SendGroupCommand(callCtx2, session, config.GroupChatID, calling, psk)
+		soroushlib.SendGroupCommand(callCtx2, session, config.GroupChatID, calling, psk, config.GroupAccessHash)
 		callCancel2()
 		recordSystemLog(fmt.Sprintf("[Tunnel] CALLING sent for server %s", offer.SID), "info")
 
@@ -822,6 +822,7 @@ func handleTunnelConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		var req struct {
 			GroupChatID          int64  `json:"groupChatId"`
+			GroupAccessHash      int64  `json:"groupAccessHash"`
 			PSK                  string `json:"psk"`
 			DispatcherUserID     int64  `json:"dispatcherUserId"`
 			DispatcherAccessHash int64  `json:"dispatcherAccessHash"`
@@ -834,13 +835,14 @@ func handleTunnelConfig(w http.ResponseWriter, r *http.Request) {
 		config := DBTunnelConfig{
 			ID:                   1,
 			GroupChatID:          req.GroupChatID,
+			GroupAccessHash:      req.GroupAccessHash,
 			PSK:                  req.PSK,
 			DispatcherUserID:     req.DispatcherUserID,
 			DispatcherAccessHash: req.DispatcherAccessHash,
 		}
 		db.Save(&config)
 
-		addLog(fmt.Sprintf("Tunnel config saved: GroupChatID=%d", req.GroupChatID), "success")
+		addLog(fmt.Sprintf("Tunnel config saved: GroupChatID=%d AccessHash=%d", req.GroupChatID, req.GroupAccessHash), "success")
 		json.NewEncoder(w).Encode(config)
 		return
 	}
@@ -989,7 +991,7 @@ func handleTunnelTest(w http.ResponseWriter, r *http.Request) {
 	// Send DISCOVER to group
 	discover := soroushlib.NewDiscover(clientID)
 	discoverCtx, discoverCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if err := soroushlib.SendGroupCommand(discoverCtx, session, tunnelCfg.GroupChatID, discover, psk); err != nil {
+	if err := soroushlib.SendGroupCommand(discoverCtx, session, tunnelCfg.GroupChatID, discover, psk, tunnelCfg.GroupAccessHash); err != nil {
 		discoverCancel()
 		steps = append(steps, TunnelTestStep{
 			Name: "group_discover", Status: "fail", Detail: fmt.Sprintf("Send DISCOVER: %v", err),

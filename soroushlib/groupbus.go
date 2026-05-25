@@ -148,14 +148,20 @@ func DecodeGroupCommand(message string, psk []byte) (*GroupCommand, error) {
 // Group Bus Send Helper — encode + send to group in one call
 // ──────────────────────────────────────────────────────────────────────────────
 
-// SendGroupCommand encodes and sends a command to the group chat
-func SendGroupCommand(ctx context.Context, session *MTProtoSession, chatID int64, cmd *GroupCommand, psk []byte) error {
+// SendGroupCommand encodes and sends a command to the group chat.
+// accessHash should be non-zero for channels/supergroups.
+func SendGroupCommand(ctx context.Context, session *MTProtoSession, chatID int64, cmd *GroupCommand, psk []byte, accessHash ...int64) error {
 	encoded, err := EncodeGroupCommand(cmd, psk)
 	if err != nil {
 		return fmt.Errorf("encode group command: %w", err)
 	}
 
-	if err := SendGroupMessage(ctx, session, chatID, encoded); err != nil {
+	ah := int64(0)
+	if len(accessHash) > 0 {
+		ah = accessHash[0]
+	}
+
+	if err := SendChannelMessage(ctx, session, chatID, ah, encoded); err != nil {
 		return fmt.Errorf("send group command: %w", err)
 	}
 
