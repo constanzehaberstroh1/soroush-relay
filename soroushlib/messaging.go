@@ -121,107 +121,122 @@ func BuildGetDialogsRequest() []byte {
 	return w.GetBytes()
 }
 
-// ParseDialogsForGroups extracts group chats from a messages.getDialogs response
-// It scans the chats vector within the response for Chat and Channel objects
+// ParseDialogsForGroups extracts group chats from a messages.getDialogs response.
+// Instead of trying to skip the dialogs and messages vectors field-by-field (which
+// is fragile and easily desynchronizes), we scan the raw response bytes for vector
+// constructor markers (0x1CB5C415). The response layout is:
+//   messages.dialogs:      [dialogs_vec] [messages_vec] [chats_vec] [users_vec]
+//   messages.dialogsSlice: count [dialogs_vec] [messages_vec] [chats_vec] [users_vec]
+// We want the 3rd vector (chats_vec).
 func ParseDialogsForGroups(cid uint32, r *TLReader) ([]DialogInfo, error) {
 	if cid == IDRPCError {
 		return nil, ParseRPCError(r)
 	}
 
-	// Both messages.dialogs and messages.dialogsSlice have similar structures
-	// messages.dialogsSlice has an extra count field at the start
-	if cid == IDDialogsSlice {
-		r.ReadInt32() // count
-	} else if cid != IDDialogs {
+	if cid != IDDialogs && cid != IDDialogsSlice {
 		return nil, fmt.Errorf("unexpected response cid=0x%08X for getDialogs", cid)
 	}
 
-	// Skip dialogs vector
-	skipTLVector(r)
+	// Get raw remaining bytes from the reader
+	raw := r.data[r.pos:]
+	log.Printf("[Dialogs] Response CID=0x%08X, remaining payload=%d bytes", cid, len(raw))
 
-	// Skip messages vector
-	skipTLVector(r)
+	// For dialogsSlice, skip the count field (4 bytes) first
+	offset := 0
+	if cid == IDDialogsSlice {
+		if len(raw) < 4 {
+			return nil, fmt.Errorf("dialogsSlice: too short for count field")
+		}
+		count := int32(binary.LittleEndian.Uint32(raw[0:4]))
+		log.Printf("[Dialogs] dialogsSlice total count=%d", count)
+		offset = 4
+	}
 
-	// Parse chats vector — this is where groups/channels live
-	groups := parseChatVector(r)
+	// Scan for vector constructor markers (0x1CB5C415) in remaining bytes
+	vectorCID := [4]byte{0x15, 0xC4, 0xB5, 0x1C} // little-endian 0x1CB5C415
+	var vectorPositions []int
+	for i := offset; i+4 <= len(raw); i += 4 { // TL is 4-byte aligned
+		if raw[i] == vectorCID[0] && raw[i+1] == vectorCID[1] &&
+			raw[i+2] == vectorCID[2] && raw[i+3] == vectorCID[3] {
+			vectorPositions = append(vectorPositions, i)
+		}
+	}
+
+	log.Printf("[Dialogs] Found %d vector markers at positions: %v", len(vectorPositions), vectorPositions)
+
+	if len(vectorPositions) < 3 {
+		// Fallback: if we can't find 3 vectors, try to parse any chats we can find
+		log.Printf("[Dialogs] WARNING: Expected at least 3 vectors (dialogs, messages, chats), got %d", len(vectorPositions))
+		return scanForChatsInRaw(raw[offset:]), nil
+	}
+
+	// The 3rd vector (index 2) is the chats vector
+	// Limit the scan range to between chats vector and users vector (or end of data)
+	chatsStart := vectorPositions[2]
+	chatsEnd := len(raw)
+	if len(vectorPositions) >= 4 {
+		chatsEnd = vectorPositions[3]
+	}
+	chatsSlice := raw[chatsStart:chatsEnd]
+
+	// Read the vector count for logging
+	if len(chatsSlice) >= 8 {
+		vecCount := int32(binary.LittleEndian.Uint32(chatsSlice[4:8]))
+		log.Printf("[Dialogs] Chats vector declares %d entries, scanning %d bytes", vecCount, len(chatsSlice))
+	}
+
+	// Use raw scanning instead of sequential parsing — much more robust
+	// because we don't need to fully consume each chat object's fields
+	groups := scanForChatsInRaw(chatsSlice)
+	log.Printf("[Dialogs] Found %d groups/channels from chats vector", len(groups))
 
 	return groups, nil
 }
 
-// skipTLVector skips over a TL vector (reads and discards all elements)
-func skipTLVector(r *TLReader) {
-	r.ReadUint32() // vector constructor ID
-	count, _ := r.ReadInt32()
-	for i := int32(0); i < count; i++ {
-		// We don't know the exact size of each element, so we skip by reading
-		// the constructor and trying to parse minimally
-		// For dialogs and messages, we'll just skip a reasonable amount
-		startPos := r.Remaining()
-		skipTLObject(r)
-		// If we didn't consume anything, break to avoid infinite loop
-		if r.Remaining() == startPos {
-			break
-		}
-	}
-}
+// scanForChatsInRaw scans raw bytes for chat/channel constructors
+// and parses id+title independently from each position found.
+func scanForChatsInRaw(raw []byte) []DialogInfo {
+	var groups []DialogInfo
 
-// skipTLObject tries to skip a single TL object (best-effort for dialogs/messages)
-func skipTLObject(r *TLReader) {
-	cid, err := r.ReadUint32()
-	if err != nil {
-		return
-	}
+	for i := 0; i+4 <= len(raw); i += 4 {
+		cid := binary.LittleEndian.Uint32(raw[i:])
 
-	switch cid {
-	case IDDialog: // dialog#d58a08c6
-		r.ReadInt32()  // flags
-		r.ReadUint32() // peer constructor
-		r.ReadInt64()  // peer id
-		r.ReadInt32()  // top_message
-		r.ReadInt32()  // read_inbox_max_id
-		r.ReadInt32()  // read_outbox_max_id
-		r.ReadInt32()  // unread_count
-		r.ReadInt32()  // unread_mentions_count
-		r.ReadInt32()  // unread_reactions_count
-		// notify_settings (peerNotifySettings)
-		skipNotifySettings(r)
-	case IDMessage: // message
-		flags, _ := r.ReadInt32()
-		r.ReadInt32() // id
-		if flags&(1<<8) != 0 {
-			r.ReadUint32() // from_id peer constructor
-			r.ReadInt64()  // from_id value
-		}
-		r.ReadUint32() // peer_id constructor
-		r.ReadInt64()  // peer_id value
-		// We can't reliably skip the rest, so stop here
-	default:
-		// Unknown — try to skip a few fields
-		for j := 0; j < 8; j++ {
-			if r.Remaining() <= 0 {
-				break
+		switch cid {
+		case IDChat:
+			subReader := NewTLReader(raw[i+4:])
+			info := parseChatObject(subReader, cid)
+			if info != nil {
+				groups = append(groups, *info)
+				log.Printf("[Dialogs] Found chat: id=%d title=%q members=%d", info.ID, info.Title, info.MembersCount)
 			}
-			r.ReadInt32()
+		case IDChannel:
+			subReader := NewTLReader(raw[i+4:])
+			info := parseChannelObject(subReader, cid)
+			if info != nil {
+				groups = append(groups, *info)
+				log.Printf("[Dialogs] Found channel: id=%d title=%q type=%s", info.ID, info.Title, info.Type)
+			}
+		case IDChatForbidden:
+			subReader := NewTLReader(raw[i+4:])
+			id, _ := subReader.ReadInt64()
+			title, _ := subReader.ReadString()
+			if title != "" {
+				groups = append(groups, DialogInfo{ID: id, Title: title + " (forbidden)", Type: "group"})
+				log.Printf("[Dialogs] Found forbidden chat: id=%d title=%q", id, title)
+			}
+		case IDChannelForbidden:
+			subReader := NewTLReader(raw[i+4:])
+			subReader.ReadInt32() // flags
+			id, _ := subReader.ReadInt64()
+			subReader.ReadInt64() // access_hash
+			title, _ := subReader.ReadString()
+			if title != "" {
+				groups = append(groups, DialogInfo{ID: id, Title: title + " (forbidden)", Type: "channel"})
+				log.Printf("[Dialogs] Found forbidden channel: id=%d title=%q", id, title)
+			}
 		}
 	}
-}
-
-// skipNotifySettings skips a peerNotifySettings object
-func skipNotifySettings(r *TLReader) {
-	r.ReadUint32() // constructor
-	flags, _ := r.ReadInt32()
-	if flags&(1<<0) != 0 {
-		r.ReadInt32() // show_previews (Bool)
-	}
-	if flags&(1<<1) != 0 {
-		r.ReadInt32() // silent (Bool)
-	}
-	if flags&(1<<2) != 0 {
-		r.ReadInt32() // mute_until
-	}
-	if flags&(1<<3) != 0 {
-		r.ReadString() // sound (NotificationSound — skip as string)
-	}
+	return groups
 }
 
 // parseChatVector parses the chats vector and extracts group/channel info
@@ -231,28 +246,35 @@ func parseChatVector(r *TLReader) []DialogInfo {
 	r.ReadUint32() // vector constructor ID (0x1cb5c415)
 	count, err := r.ReadInt32()
 	if err != nil || count <= 0 {
+		log.Printf("[Dialogs] Chats vector count=%d (err=%v)", count, err)
 		return groups
 	}
+
+	log.Printf("[Dialogs] Chats vector contains %d entries", count)
 
 	for i := int32(0); i < count; i++ {
 		cid, err := r.ReadUint32()
 		if err != nil {
+			log.Printf("[Dialogs] Error reading chat[%d] constructor: %v", i, err)
 			break
 		}
+
+		log.Printf("[Dialogs] Chat[%d] constructor=0x%08X, remaining=%d", i, cid, r.Remaining())
 
 		switch cid {
 		case IDChat, 0x29562865: // chat or chatEmpty variants
 			info := parseChatObject(r, cid)
 			if info != nil {
+				log.Printf("[Dialogs] Found group: id=%d title=%q members=%d", info.ID, info.Title, info.MembersCount)
 				groups = append(groups, *info)
 			}
-		case IDChannel, 0x94F592DB, 0x8261AC61: // channel variants across layers
+		case IDChannel: // channel (layer 182)
 			info := parseChannelObject(r, cid)
 			if info != nil {
+				log.Printf("[Dialogs] Found channel: id=%d title=%q type=%s", info.ID, info.Title, info.Type)
 				groups = append(groups, *info)
 			}
 		case IDChatForbidden:
-			// chat_id + title
 			id, _ := r.ReadInt64()
 			title, _ := r.ReadString()
 			groups = append(groups, DialogInfo{
@@ -272,11 +294,9 @@ func parseChatVector(r *TLReader) []DialogInfo {
 				Type:  "channel",
 			})
 		default:
-			// Unknown chat type — try to skip
-			log.Printf("[Dialogs] Unknown chat constructor: 0x%08X", cid)
-			// Read some fields to try to advance
-			r.ReadInt64()
-			r.ReadString()
+			// Unknown chat constructor — log and stop sequential parsing
+			log.Printf("[Dialogs] Unknown chat constructor: 0x%08X at chat[%d], stopping", cid, i)
+			return groups
 		}
 	}
 
@@ -316,9 +336,14 @@ func parseChatObject(r *TLReader, cid uint32) *DialogInfo {
 }
 
 // parseChannelObject parses a channel/supergroup TL object
+// Soroush layer 182 schema:
+//   channel#8e87ccd8 flags:# ... flags2:# ... id:long
+//     access_hash:flags.13?long title:string username:flags.6?string
+//     photo:ChatPhoto date:int ...
 func parseChannelObject(r *TLReader, cid uint32) *DialogInfo {
 	flags, _ := r.ReadInt32()
-	_ = flags
+	flags2, _ := r.ReadInt32() // flags2 field (layer 182)
+	_ = flags2
 	id, _ := r.ReadInt64()
 
 	// access_hash (if flags bit 13)
@@ -327,6 +352,11 @@ func parseChannelObject(r *TLReader, cid uint32) *DialogInfo {
 	}
 
 	title, _ := r.ReadString()
+
+	// username (if flags bit 6)
+	if flags&(1<<6) != 0 {
+		r.ReadString() // username
+	}
 
 	chatType := "channel"
 	if flags&(1<<8) != 0 { // megagroup flag
