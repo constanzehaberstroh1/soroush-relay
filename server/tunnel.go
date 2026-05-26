@@ -177,8 +177,8 @@ func runGroupObserverOnce(ctx context.Context) error {
 
 	serverID := account.ID
 
-	// Send initial heartbeat WITH retry (handles bad_server_salt, primes the session)
-	// We use SendAndWait directly so the salt gets corrected before ListenForMessages starts.
+	// Send initial heartbeat wrapped in initConnection (required by Soroush for new sessions).
+	// Without initConnection, Soroush processes the RPC then closes the WebSocket.
 	hb := soroushlib.NewHeartbeat(serverID, account.SoroushUserID, account.AccessHash, 0)
 	encoded, err := soroushlib.EncodeGroupCommand(hb, psk)
 	if err != nil {
@@ -186,9 +186,10 @@ func runGroupObserverOnce(ctx context.Context) error {
 		return fmt.Errorf("encode heartbeat: %w", err)
 	}
 	hbBody := soroushlib.BuildSendChannelMessage(chatID, chatAH, encoded, time.Now().UnixNano())
+	wrappedBody := soroushlib.WrapInitConnection(soroushlib.SoroushAppID, hbBody)
 
 	hbCtx, hbCancel := context.WithTimeout(ctx, 30*time.Second)
-	_, _, err = session.SendAndWait(hbCtx, hbBody, true)
+	_, _, err = session.SendAndWait(hbCtx, wrappedBody, true)
 	hbCancel()
 	if err != nil {
 		recordSystemLog(fmt.Sprintf("[GroupObserver] Initial heartbeat failed: %v", err), "warn")
@@ -196,10 +197,18 @@ func runGroupObserverOnce(ctx context.Context) error {
 		recordSystemLog("[GroupObserver] Initial heartbeat sent and confirmed ✅", "success")
 	}
 
+	// Send ping_delay_disconnect to register keep-alive (75s disconnect delay)
+	pingBody := soroushlib.BuildPingDelayDisconnectRequest(time.Now().UnixNano(), 75)
+	session.Send(ctx, pingBody, false)
+
 	repliedDiscovers := make(map[string]time.Time)
 
 	heartbeatTicker := time.NewTicker(5 * time.Minute)
 	defer heartbeatTicker.Stop()
+
+	// Ping ticker to keep the Soroush WebSocket alive
+	pingTicker := time.NewTicker(60 * time.Second)
+	defer pingTicker.Stop()
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -255,6 +264,10 @@ func runGroupObserverOnce(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-pingTicker.C:
+			// Keep the connection alive with periodic pings
+			pingBody := soroushlib.BuildPingDelayDisconnectRequest(time.Now().UnixNano(), 75)
+			session.Send(ctx, pingBody, false)
 		case <-heartbeatTicker.C:
 			hb := soroushlib.NewHeartbeat(serverID, account.SoroushUserID, account.AccessHash, len(serverTunnel.activeWorkers))
 			hbCtx, hbCancel := context.WithTimeout(ctx, 10*time.Second)
