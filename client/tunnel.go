@@ -835,11 +835,19 @@ func handleTunnelStatus(w http.ResponseWriter, r *http.Request) {
 		uptime = time.Since(tunnel.startedAt).Round(time.Second).String()
 	}
 
+	socksReady := tunnel.socksListener != nil
+	socksAddr := ""
+	if socksReady {
+		socksAddr = tunnel.socksListener.Addr().String()
+	}
+
 	resp := map[string]interface{}{
-		"phase":     tunnel.phase,
-		"latencyMs": tunnel.latencyMs,
-		"uptime":    uptime,
-		"error":     tunnel.errorMsg,
+		"phase":      tunnel.phase,
+		"latencyMs":  tunnel.latencyMs,
+		"uptime":     uptime,
+		"error":      tunnel.errorMsg,
+		"socksReady": socksReady,
+		"socksAddr":  socksAddr,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

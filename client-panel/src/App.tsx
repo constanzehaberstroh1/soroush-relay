@@ -240,6 +240,8 @@ function DashboardView() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [selectedAccount, setSelectedAccount] = useState<string>('');
   const [bandwidthData, setBandwidthData] = useState<{ time: string; download: number; upload: number }[]>([]);
+  const [socksReady, setSocksReady] = useState(false);
+  const [socksAddr, setSocksAddr] = useState('');
 
   const fetchStatus = async () => {
     try {
@@ -274,7 +276,19 @@ function DashboardView() {
     fetchAccounts();
     const interval = setInterval(fetchStatus, 3000);
 
-    return () => clearInterval(interval);
+    // Also poll tunnel-specific status for SOCKS5 info
+    const tunnelInterval = setInterval(async () => {
+      try {
+        const res = await fetch(`${API_BASE}/tunnel/status`, { headers: getHeaders() });
+        if (res.ok) {
+          const data = await res.json();
+          setSocksReady(data.socksReady || false);
+          setSocksAddr(data.socksAddr || '');
+        }
+      } catch (e) { /* ignore */ }
+    }, 3000);
+
+    return () => { clearInterval(interval); clearInterval(tunnelInterval); };
   }, []);
 
   // Simulating live bandwidth rate when connected
@@ -340,19 +354,32 @@ function DashboardView() {
               <Paper variant="outlined" sx={{ p: 2, bgcolor: 'background.default', borderRadius: 2 }}>
                 <Grid container spacing={1}>
                   <Grid item xs={6}>
-                    <Typography variant="caption" color="text.secondary">Local Host</Typography>
-                    <Typography variant="body2" fontWeight="bold">127.0.0.1</Typography>
+                    <Typography variant="caption" color="text.secondary">SOCKS5 Proxy</Typography>
+                    <Typography variant="body2" fontWeight="bold">{socksReady ? socksAddr : '127.0.0.1:1080'}</Typography>
                   </Grid>
                   <Grid item xs={6}>
-                    <Typography variant="caption" color="text.secondary">SOCKS5 Port</Typography>
-                    <Typography variant="body2" fontWeight="bold">4046</Typography>
+                    <Typography variant="caption" color="text.secondary">Proxy Status</Typography>
+                    <Typography variant="body2" fontWeight="bold" color={socksReady ? 'success.main' : 'text.secondary'}>
+                      {socksReady ? '● Active' : '○ Inactive'}
+                    </Typography>
                   </Grid>
                   <Grid item xs={12}>
                     <Typography variant="caption" color="text.secondary">Obfuscation Protocol</Typography>
-                    <Typography variant="body2" color="primary.main" fontWeight="bold">Soroush Voice Call Masquerade</Typography>
+                    <Typography variant="body2" color="primary.main" fontWeight="bold">Soroush Voice Call Masquerade + yamux/SOCKS5</Typography>
                   </Grid>
                 </Grid>
               </Paper>
+
+              {socksReady && (
+                <Paper variant="outlined" sx={{ p: 1.5, bgcolor: 'rgba(16,185,129,0.08)', borderColor: 'success.main', borderRadius: 2 }}>
+                  <Typography variant="caption" color="success.main" fontWeight={700} display="block" gutterBottom>
+                    🌐 SOCKS5 Proxy Ready
+                  </Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    Configure your browser: Settings → Network → Manual Proxy → SOCKS5 Host: <b>127.0.0.1</b> Port: <b>1080</b>
+                  </Typography>
+                </Paper>
+              )}
 
               <TextField
                 select

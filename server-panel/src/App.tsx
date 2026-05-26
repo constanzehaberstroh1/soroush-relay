@@ -1016,8 +1016,9 @@ function ConfigView() {
             />
           </Box>
           <Typography variant="body2" color="text.secondary" mb={2}>
-            The tunnel engine connects to Soroush and listens for client DISCOVER messages in the group chat.
-            It must be running for clients to find and connect to this server.
+            The tunnel engine connects to Soroush, listens for client DISCOVER messages, and establishes
+            WebRTC data channels. Each connected client gets a SOCKS5 proxy server (via yamux multiplexing)
+            for real internet traffic routing. It must be running for clients to find and connect to this server.
           </Typography>
 
           {engineError && (
