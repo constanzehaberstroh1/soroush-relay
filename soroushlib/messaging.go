@@ -480,6 +480,7 @@ type IncomingMessage struct {
 // It calls the handler function for each incoming text message.
 // Returns when the context is cancelled.
 func ListenForMessages(ctx context.Context, session *MTProtoSession, handler func(msg IncomingMessage)) error {
+	consecutiveErrors := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -495,10 +496,29 @@ func ListenForMessages(ctx context.Context, session *MTProtoSession, handler fun
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			// Timeout or transient error — keep listening
-			log.Printf("[Messaging] recv error (will retry): %v", err)
+
+			errStr := err.Error()
+			// Permanent connection errors — exit immediately
+			if strings.Contains(errStr, "closed network connection") ||
+				strings.Contains(errStr, "broken pipe") ||
+				strings.Contains(errStr, "connection reset") ||
+				strings.Contains(errStr, "EOF") {
+				log.Printf("[Messaging] Connection lost (permanent): %v", err)
+				return fmt.Errorf("connection lost: %w", err)
+			}
+
+			// Transient error (timeout etc.) — retry with backoff
+			consecutiveErrors++
+			if consecutiveErrors > 50 {
+				log.Printf("[Messaging] Too many consecutive errors (%d), giving up: %v", consecutiveErrors, err)
+				return fmt.Errorf("too many errors: %w", err)
+			}
+			log.Printf("[Messaging] recv error (will retry %d): %v", consecutiveErrors, err)
+			time.Sleep(time.Duration(consecutiveErrors*100) * time.Millisecond)
 			continue
 		}
+
+		consecutiveErrors = 0
 
 		// Handle different update wrapper types
 		processUpdate(cid, reader, session, handler)
@@ -671,7 +691,7 @@ func SendTextMessage(ctx context.Context, session *MTProtoSession, userID int64,
 	randomID := time.Now().UnixNano()
 	body := BuildSendTextMessage(userID, accessHash, text, randomID)
 
-	_, _, err := session.SendAndWait(ctx, body, true)
+	_, err := session.Send(ctx, body, true)
 	if err != nil {
 		return fmt.Errorf("send text message: %w", err)
 	}
@@ -684,7 +704,7 @@ func SendGroupMessage(ctx context.Context, session *MTProtoSession, chatID int64
 	randomID := time.Now().UnixNano()
 	body := BuildSendGroupMessage(chatID, text, randomID)
 
-	_, _, err := session.SendAndWait(ctx, body, true)
+	_, err := session.Send(ctx, body, true)
 	if err != nil {
 		return fmt.Errorf("send group message: %w", err)
 	}
@@ -698,7 +718,7 @@ func SendChannelMessage(ctx context.Context, session *MTProtoSession, chatID int
 	randomID := time.Now().UnixNano()
 	body := BuildSendChannelMessage(chatID, accessHash, text, randomID)
 
-	_, _, err := session.SendAndWait(ctx, body, true)
+	_, err := session.Send(ctx, body, true)
 	if err != nil {
 		return fmt.Errorf("send channel message: %w", err)
 	}

@@ -209,6 +209,91 @@ func (s *MTProtoSession) SendAndWait(ctx context.Context, body []byte, contentRe
 	return 0, nil, fmt.Errorf("SendAndWait: failed after 3 retries (bad_server_salt)")
 }
 
+// WarmUpSession sends a lightweight RPC request (updates.getState) and handles
+// bad_server_salt / new_session_created responses to prime the session salt.
+// Call this BEFORE starting ListenForMessages to ensure the salt is correct.
+func (s *MTProtoSession) WarmUpSession(ctx context.Context) error {
+	// Build a minimal updates.getState request (constructor 0xedd4882a)
+	w := NewTLWriter()
+	w.WriteUint32(0xEDD4882A) // updates.getState
+	body := w.GetBytes()
+
+	log.Println("[MTProto] Warming up session (updates.getState)...")
+
+	for attempt := 0; attempt < 3; attempt++ {
+		_, err := s.Send(ctx, body, true)
+		if err != nil {
+			return fmt.Errorf("warm up send: %w", err)
+		}
+
+		recvCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		cid, reader, err := s.Recv(recvCtx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("warm up recv: %w", err)
+		}
+
+		switch cid {
+		case IDBadServerSalt:
+			reader.ReadInt64() // bad_msg_id
+			reader.ReadInt32() // bad_msg_seqno
+			reader.ReadInt32() // error_code
+			newSalt, _ := reader.ReadInt64()
+			s.ServerSalt = newSalt
+			log.Printf("[MTProto] Warm-up: updated salt to %d (attempt %d)", newSalt, attempt+1)
+			continue
+
+		case IDNewSession:
+			reader.ReadInt64() // first_msg_id
+			reader.ReadInt64() // unique_id
+			newSalt, _ := reader.ReadInt64()
+			s.ServerSalt = newSalt
+			log.Printf("[MTProto] Warm-up: new session, salt=%d (attempt %d)", newSalt, attempt+1)
+			continue
+
+		case IDMsgsAck:
+			// ACK received, try to read the actual response
+			recvCtx2, cancel2 := context.WithTimeout(ctx, 5*time.Second)
+			_, _, _ = s.Recv(recvCtx2)
+			cancel2()
+			log.Println("[MTProto] Warm-up: session ready ✅")
+			return nil
+
+		case IDMsgContainer:
+			// Container — check for salt updates inside, otherwise session is ready
+			count, _ := reader.ReadInt32()
+			saltUpdated := false
+			for i := int32(0); i < count; i++ {
+				reader.ReadInt64() // msg_id
+				reader.ReadInt32() // seq_no
+				bodyLen, _ := reader.ReadInt32()
+				subBody, _ := reader.ReadRaw(int(bodyLen))
+				if len(subBody) >= 4 {
+					subCID := binary.LittleEndian.Uint32(subBody[:4])
+					if subCID == IDBadServerSalt && len(subBody) >= 28 {
+						newSalt := int64(binary.LittleEndian.Uint64(subBody[20:28]))
+						s.ServerSalt = newSalt
+						saltUpdated = true
+						log.Printf("[MTProto] Warm-up: salt from container = %d", newSalt)
+					}
+				}
+			}
+			if saltUpdated {
+				continue
+			}
+			log.Println("[MTProto] Warm-up: session ready ✅")
+			return nil
+
+		default:
+			// Got an actual response — session is warm
+			log.Printf("[MTProto] Warm-up: got CID=0x%08X, session ready ✅", cid)
+			return nil
+		}
+	}
+	log.Println("[MTProto] Warm-up: completed after 3 attempts")
+	return nil
+}
+
 // Recv receives and decrypts an MTProto message.
 // Returns (constructor_id, TLReader, error)
 func (s *MTProtoSession) Recv(ctx context.Context) (uint32, *TLReader, error) {

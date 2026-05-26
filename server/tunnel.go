@@ -106,7 +106,8 @@ func stopServerTunnel() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Group Observer — joins "My lovely family" group, sends heartbeats, handles DISCOVER
+// Group Observer — monitors group, sends heartbeats, handles DISCOVER
+// Auto-reconnects on connection loss.
 // ──────────────────────────────────────────────────────────────────────────────
 
 func runGroupObserver(ctx context.Context) {
@@ -114,71 +115,100 @@ func runGroupObserver(ctx context.Context) {
 		if r := recover(); r != nil {
 			recordSystemLog(fmt.Sprintf("[GroupObserver] Panic: %v", r), "error")
 		}
+		serverTunnel.mu.Lock()
+		serverTunnel.running = false
+		serverTunnel.dispatcherReady = false
+		serverTunnel.mu.Unlock()
 	}()
 
-	// Find the first connected account for group messaging
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		err := runGroupObserverOnce(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+
+		recordSystemLog(fmt.Sprintf("[GroupObserver] Connection lost: %v. Reconnecting in 10s...", err), "warn")
+		serverTunnel.mu.Lock()
+		serverTunnel.dispatcherReady = false
+		serverTunnel.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(10 * time.Second):
+		}
+	}
+}
+
+func runGroupObserverOnce(ctx context.Context) error {
 	var account DBSoroushAccount
 	if err := db.Where("status = ? AND length(auth_key) > 0", "connected").First(&account).Error; err != nil {
-		recordSystemLog("[GroupObserver] No connected account available for group messaging.", "error")
-		return
+		recordSystemLog("[GroupObserver] No connected account available.", "error")
+		return fmt.Errorf("no account: %w", err)
 	}
 
-	recordSystemLog(fmt.Sprintf("[GroupObserver] Starting with account: %s (ID: %d)", account.PhoneNumber, account.SoroushUserID), "info")
+	recordSystemLog(fmt.Sprintf("[GroupObserver] Starting with account: %s (UID: %d)", account.PhoneNumber, account.SoroushUserID), "info")
 
-	// Connect to Soroush
 	session, transport := soroushlib.RestoreSession(account.AuthKey, account.AuthKeyID, account.ServerSalt)
 
 	connCtx, connCancel := context.WithTimeout(ctx, 15*time.Second)
 	if err := transport.Connect(connCtx); err != nil {
 		connCancel()
 		recordSystemLog(fmt.Sprintf("[GroupObserver] Transport connect failed: %v", err), "error")
-		return
+		return fmt.Errorf("connect: %w", err)
 	}
 	connCancel()
 	defer transport.Disconnect()
 
-	recordSystemLog("[GroupObserver] Connected to Soroush. Monitoring group...", "success")
+	recordSystemLog("[GroupObserver] Connected to Soroush ✅", "success")
+
+	warmCtx, warmCancel := context.WithTimeout(ctx, 20*time.Second)
+	if err := session.WarmUpSession(warmCtx); err != nil {
+		warmCancel()
+		recordSystemLog(fmt.Sprintf("[GroupObserver] Session warm-up failed: %v", err), "warn")
+	} else {
+		warmCancel()
+	}
 
 	serverTunnel.mu.Lock()
 	serverTunnel.dispatcherReady = true
-	serverTunnel.mu.Unlock()
-
 	chatID := serverTunnel.groupChatID
 	chatAH := serverTunnel.groupAccessHash
 	psk := serverTunnel.psk
+	serverTunnel.mu.Unlock()
+
 	serverID := account.ID
 
-	// Send initial heartbeat
 	hb := soroushlib.NewHeartbeat(serverID, account.SoroushUserID, account.AccessHash, 0)
 	if err := soroushlib.SendGroupCommand(ctx, session, chatID, hb, psk, chatAH); err != nil {
 		recordSystemLog(fmt.Sprintf("[GroupObserver] Initial heartbeat failed: %v", err), "warn")
+	} else {
+		recordSystemLog("[GroupObserver] Initial heartbeat sent ✅", "success")
 	}
 
-	// Track pending DISCOVERs we've already replied to
 	repliedDiscovers := make(map[string]time.Time)
 
-	// Start heartbeat ticker (every 5 minutes)
 	heartbeatTicker := time.NewTicker(5 * time.Minute)
 	defer heartbeatTicker.Stop()
 
-	// Listen for group messages
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- soroushlib.ListenForMessages(ctx, session, func(msg soroushlib.IncomingMessage) {
-			// Only process group messages for our group
 			if !msg.IsGroup || msg.ChatID != chatID {
 				return
 			}
-
-			// Ignore our own messages
 			if msg.FromUserID == account.SoroushUserID {
 				return
 			}
 
-			// Try to decode as a group command
 			cmd, err := soroushlib.DecodeGroupCommand(msg.Text, psk)
 			if err != nil {
-				// Not a stealth command, just a normal chat message — ignore
 				return
 			}
 
@@ -186,15 +216,12 @@ func runGroupObserver(ctx context.Context) {
 
 			switch cmd.Cmd {
 			case soroushlib.CmdDiscover:
-				// Check if we already replied to this DISCOVER
 				if _, ok := repliedDiscovers[cmd.CID]; ok {
 					return
 				}
 				repliedDiscovers[cmd.CID] = time.Now()
 
-				// Run in goroutine to avoid blocking the message listener
 				go func(targetCID string) {
-					// Random delay to prevent race conditions (0-500ms)
 					delay := time.Duration(rand.Intn(500)) * time.Millisecond
 					time.Sleep(delay)
 
@@ -209,30 +236,27 @@ func runGroupObserver(ctx context.Context) {
 				}(cmd.CID)
 
 			case soroushlib.CmdCalling:
-				// Client is calling us — prepare for incoming WebRTC call
 				if cmd.SID == serverID {
-					recordSystemLog(fmt.Sprintf("[GroupObserver] Client %s is CALLING us! Preparing worker...", cmd.CID), "success")
+					recordSystemLog(fmt.Sprintf("[GroupObserver] Client %s is CALLING us!", cmd.CID), "success")
 					go startWorkerListener(ctx, &account, msg.FromUserID)
 				}
 
 			case soroushlib.CmdDisconnect:
-				recordSystemLog(fmt.Sprintf("[GroupObserver] Received DISCONNECT from %s", cmd.SID), "info")
+				recordSystemLog(fmt.Sprintf("[GroupObserver] DISCONNECT from %s", cmd.SID), "info")
 			}
 		})
 	}()
 
-	// Main loop: send heartbeats + wait
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case <-heartbeatTicker.C:
 			hb := soroushlib.NewHeartbeat(serverID, account.SoroushUserID, account.AccessHash, len(serverTunnel.activeWorkers))
 			hbCtx, hbCancel := context.WithTimeout(ctx, 10*time.Second)
 			soroushlib.SendGroupCommand(hbCtx, session, chatID, hb, psk, chatAH)
 			hbCancel()
 
-			// Prune stale repliedDiscovers entries (older than 5 minutes)
 			now := time.Now()
 			for k, v := range repliedDiscovers {
 				if now.Sub(v) > 5*time.Minute {
@@ -242,8 +266,9 @@ func runGroupObserver(ctx context.Context) {
 		case err := <-errCh:
 			if err != nil && ctx.Err() == nil {
 				recordSystemLog(fmt.Sprintf("[GroupObserver] Listen error: %v", err), "error")
+				return err
 			}
-			return
+			return nil
 		}
 	}
 }

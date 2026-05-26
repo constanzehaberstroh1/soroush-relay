@@ -188,6 +188,11 @@ func runTunnelFlow(ctx context.Context, cancel context.CancelFunc) {
 		}
 		clientID := clientAcc.ID
 
+		// Warm up session before sending
+		warmCtx, warmCancel := context.WithTimeout(ctx, 15*time.Second)
+		session.WarmUpSession(warmCtx)
+		warmCancel()
+
 		// Send DISCOVER to group
 		recordSystemLog("[Tunnel] Broadcasting DISCOVER to group...", "info")
 		discover := soroushlib.NewDiscover(clientID)
@@ -987,6 +992,11 @@ func handleTunnelTest(w http.ResponseWriter, r *http.Request) {
 		psk = []byte(tunnelCfg.PSK)
 	}
 	clientID := account.ID
+
+	// Warm up session to prime server salt
+	warmCtx, warmCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	session.WarmUpSession(warmCtx)
+	warmCancel()
 
 	// Send DISCOVER to group
 	discover := soroushlib.NewDiscover(clientID)
