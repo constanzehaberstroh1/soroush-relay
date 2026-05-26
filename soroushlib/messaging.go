@@ -480,7 +480,6 @@ type IncomingMessage struct {
 // It calls the handler function for each incoming text message.
 // Returns when the context is cancelled.
 func ListenForMessages(ctx context.Context, session *MTProtoSession, handler func(msg IncomingMessage)) error {
-	consecutiveErrors := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -488,9 +487,10 @@ func ListenForMessages(ctx context.Context, session *MTProtoSession, handler fun
 		default:
 		}
 
-		recvCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		cid, reader, err := session.Recv(recvCtx)
-		cancel()
+		// Use the parent context directly — NOT a timeout sub-context.
+		// coder/websocket permanently closes the TCP socket when a context expires,
+		// so a 30s timeout would kill the connection on idle groups.
+		cid, reader, err := session.Recv(ctx)
 
 		if err != nil {
 			if ctx.Err() != nil {
@@ -507,18 +507,10 @@ func ListenForMessages(ctx context.Context, session *MTProtoSession, handler fun
 				return fmt.Errorf("connection lost: %w", err)
 			}
 
-			// Transient error (timeout etc.) — retry with backoff
-			consecutiveErrors++
-			if consecutiveErrors > 50 {
-				log.Printf("[Messaging] Too many consecutive errors (%d), giving up: %v", consecutiveErrors, err)
-				return fmt.Errorf("too many errors: %w", err)
-			}
-			log.Printf("[Messaging] recv error (will retry %d): %v", consecutiveErrors, err)
-			time.Sleep(time.Duration(consecutiveErrors*100) * time.Millisecond)
-			continue
+			// Transient error — log and exit (let caller reconnect)
+			log.Printf("[Messaging] recv error: %v", err)
+			return fmt.Errorf("recv error: %w", err)
 		}
-
-		consecutiveErrors = 0
 
 		// Handle different update wrapper types
 		processUpdate(cid, reader, session, handler)

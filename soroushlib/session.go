@@ -140,10 +140,8 @@ func (s *MTProtoSession) SendAndWait(ctx context.Context, body []byte, contentRe
 			return 0, nil, fmt.Errorf("send: %w", err)
 		}
 
-		// Read response with timeout
-		recvCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		cid, reader, err := s.Recv(recvCtx)
-		cancel()
+		// Read response — use parent ctx (coder/websocket kills the socket on context expiry)
+		cid, reader, err := s.Recv(ctx)
 		if err != nil {
 			return 0, nil, fmt.Errorf("recv: %w", err)
 		}
@@ -170,9 +168,7 @@ func (s *MTProtoSession) SendAndWait(ctx context.Context, body []byte, contentRe
 
 		case IDMsgsAck:
 			// Just an ACK, need to read the actual response
-			recvCtx2, cancel2 := context.WithTimeout(ctx, 10*time.Second)
-			cid2, reader2, err2 := s.Recv(recvCtx2)
-			cancel2()
+			cid2, reader2, err2 := s.Recv(ctx)
 			if err2 != nil {
 				return 0, nil, fmt.Errorf("recv after ack: %w", err2)
 			}
@@ -226,9 +222,7 @@ func (s *MTProtoSession) WarmUpSession(ctx context.Context) error {
 			return fmt.Errorf("warm up send: %w", err)
 		}
 
-		recvCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		cid, reader, err := s.Recv(recvCtx)
-		cancel()
+		cid, reader, err := s.Recv(ctx)
 		if err != nil {
 			return fmt.Errorf("warm up recv: %w", err)
 		}
@@ -253,9 +247,7 @@ func (s *MTProtoSession) WarmUpSession(ctx context.Context) error {
 
 		case IDMsgsAck:
 			// ACK received, try to read the actual response
-			recvCtx2, cancel2 := context.WithTimeout(ctx, 5*time.Second)
-			_, _, _ = s.Recv(recvCtx2)
-			cancel2()
+			s.Recv(ctx)
 			log.Println("[MTProto] Warm-up: session ready ✅")
 			return nil
 

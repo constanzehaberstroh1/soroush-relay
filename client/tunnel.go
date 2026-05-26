@@ -188,7 +188,7 @@ func runTunnelFlow(ctx context.Context, cancel context.CancelFunc) {
 		}
 		clientID := clientAcc.ID
 
-		// Send DISCOVER to group (uses SendAndWait to handle bad_server_salt)
+		// Send DISCOVER to group (wrapped in initConnection, uses SendAndWait for salt handling)
 		recordSystemLog("[Tunnel] Broadcasting DISCOVER to group...", "info")
 		discover := soroushlib.NewDiscover(clientID)
 		encoded, err := soroushlib.EncodeGroupCommand(discover, psk)
@@ -197,8 +197,9 @@ func runTunnelFlow(ctx context.Context, cancel context.CancelFunc) {
 			return
 		}
 		discBody := soroushlib.BuildSendChannelMessage(config.GroupChatID, config.GroupAccessHash, encoded, time.Now().UnixNano())
+		wrappedDisc := soroushlib.WrapInitConnection(soroushlib.SoroushAppID, discBody)
 		discCtx, discCancel := context.WithTimeout(ctx, 30*time.Second)
-		_, _, err = session.SendAndWait(discCtx, discBody, true)
+		_, _, err = session.SendAndWait(discCtx, wrappedDisc, true)
 		discCancel()
 		if err != nil {
 			setTunnelError(fmt.Sprintf("DISCOVER failed: %v", err))
@@ -1007,8 +1008,9 @@ func handleTunnelTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	discBody := soroushlib.BuildSendChannelMessage(tunnelCfg.GroupChatID, tunnelCfg.GroupAccessHash, encoded, time.Now().UnixNano())
+	wrappedDisc := soroushlib.WrapInitConnection(soroushlib.SoroushAppID, discBody)
 	discoverCtx, discoverCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	_, _, discErr := session.SendAndWait(discoverCtx, discBody, true)
+	_, _, discErr := session.SendAndWait(discoverCtx, wrappedDisc, true)
 	discoverCancel()
 	if discErr != nil {
 		steps = append(steps, TunnelTestStep{

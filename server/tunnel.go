@@ -235,7 +235,7 @@ func runGroupObserverOnce(ctx context.Context) error {
 				repliedDiscovers[cmd.CID] = time.Now()
 
 				go func(targetCID string) {
-					delay := time.Duration(rand.Intn(500)) * time.Millisecond
+					delay := time.Duration(2000+rand.Intn(2000)) * time.Millisecond
 					time.Sleep(delay)
 
 					offer := soroushlib.NewOffer(targetCID, serverID, account.SoroushUserID, account.AccessHash)
