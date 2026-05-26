@@ -199,7 +199,7 @@ func runGroupObserverOnce(ctx context.Context) error {
 
 	// Send ping_delay_disconnect to register keep-alive (75s disconnect delay)
 	pingBody := soroushlib.BuildPingDelayDisconnectRequest(time.Now().UnixNano(), 75)
-	session.Send(ctx, pingBody, false)
+	session.Send(ctx, pingBody, true)
 
 	repliedDiscovers := make(map[string]time.Time)
 
@@ -267,7 +267,7 @@ func runGroupObserverOnce(ctx context.Context) error {
 		case <-pingTicker.C:
 			// Keep the connection alive with periodic pings
 			pingBody := soroushlib.BuildPingDelayDisconnectRequest(time.Now().UnixNano(), 75)
-			session.Send(ctx, pingBody, false)
+			session.Send(ctx, pingBody, true)
 		case <-heartbeatTicker.C:
 			hb := soroushlib.NewHeartbeat(serverID, account.SoroushUserID, account.AccessHash, len(serverTunnel.activeWorkers))
 			hbCtx, hbCancel := context.WithTimeout(ctx, 10*time.Second)
