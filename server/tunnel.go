@@ -168,14 +168,6 @@ func runGroupObserverOnce(ctx context.Context) error {
 
 	recordSystemLog("[GroupObserver] Connected to Soroush ✅", "success")
 
-	warmCtx, warmCancel := context.WithTimeout(ctx, 20*time.Second)
-	if err := session.WarmUpSession(warmCtx); err != nil {
-		warmCancel()
-		recordSystemLog(fmt.Sprintf("[GroupObserver] Session warm-up failed: %v", err), "warn")
-	} else {
-		warmCancel()
-	}
-
 	serverTunnel.mu.Lock()
 	serverTunnel.dispatcherReady = true
 	chatID := serverTunnel.groupChatID
@@ -185,11 +177,23 @@ func runGroupObserverOnce(ctx context.Context) error {
 
 	serverID := account.ID
 
+	// Send initial heartbeat WITH retry (handles bad_server_salt, primes the session)
+	// We use SendAndWait directly so the salt gets corrected before ListenForMessages starts.
 	hb := soroushlib.NewHeartbeat(serverID, account.SoroushUserID, account.AccessHash, 0)
-	if err := soroushlib.SendGroupCommand(ctx, session, chatID, hb, psk, chatAH); err != nil {
+	encoded, err := soroushlib.EncodeGroupCommand(hb, psk)
+	if err != nil {
+		recordSystemLog(fmt.Sprintf("[GroupObserver] Encode heartbeat failed: %v", err), "error")
+		return fmt.Errorf("encode heartbeat: %w", err)
+	}
+	hbBody := soroushlib.BuildSendChannelMessage(chatID, chatAH, encoded, time.Now().UnixNano())
+
+	hbCtx, hbCancel := context.WithTimeout(ctx, 30*time.Second)
+	_, _, err = session.SendAndWait(hbCtx, hbBody, true)
+	hbCancel()
+	if err != nil {
 		recordSystemLog(fmt.Sprintf("[GroupObserver] Initial heartbeat failed: %v", err), "warn")
 	} else {
-		recordSystemLog("[GroupObserver] Initial heartbeat sent ✅", "success")
+		recordSystemLog("[GroupObserver] Initial heartbeat sent and confirmed ✅", "success")
 	}
 
 	repliedDiscovers := make(map[string]time.Time)

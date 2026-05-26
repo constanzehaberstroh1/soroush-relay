@@ -188,21 +188,23 @@ func runTunnelFlow(ctx context.Context, cancel context.CancelFunc) {
 		}
 		clientID := clientAcc.ID
 
-		// Warm up session before sending
-		warmCtx, warmCancel := context.WithTimeout(ctx, 15*time.Second)
-		session.WarmUpSession(warmCtx)
-		warmCancel()
-
-		// Send DISCOVER to group
+		// Send DISCOVER to group (uses SendAndWait to handle bad_server_salt)
 		recordSystemLog("[Tunnel] Broadcasting DISCOVER to group...", "info")
 		discover := soroushlib.NewDiscover(clientID)
-		discCtx, discCancel := context.WithTimeout(ctx, 10*time.Second)
-		if err := soroushlib.SendGroupCommand(discCtx, session, config.GroupChatID, discover, psk, config.GroupAccessHash); err != nil {
-			discCancel()
+		encoded, err := soroushlib.EncodeGroupCommand(discover, psk)
+		if err != nil {
+			setTunnelError(fmt.Sprintf("Encode DISCOVER: %v", err))
+			return
+		}
+		discBody := soroushlib.BuildSendChannelMessage(config.GroupChatID, config.GroupAccessHash, encoded, time.Now().UnixNano())
+		discCtx, discCancel := context.WithTimeout(ctx, 30*time.Second)
+		_, _, err = session.SendAndWait(discCtx, discBody, true)
+		discCancel()
+		if err != nil {
 			setTunnelError(fmt.Sprintf("DISCOVER failed: %v", err))
 			return
 		}
-		discCancel()
+		recordSystemLog("[Tunnel] DISCOVER sent ✅", "success")
 
 		// Wait for OFFER
 		offerCtx, offerCancel := context.WithTimeout(ctx, 30*time.Second)
@@ -993,24 +995,29 @@ func handleTunnelTest(w http.ResponseWriter, r *http.Request) {
 	}
 	clientID := account.ID
 
-	// Warm up session to prime server salt
-	warmCtx, warmCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	session.WarmUpSession(warmCtx)
-	warmCancel()
-
-	// Send DISCOVER to group
+	// Send DISCOVER to group (uses SendAndWait to handle bad_server_salt + prime session)
 	discover := soroushlib.NewDiscover(clientID)
-	discoverCtx, discoverCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if err := soroushlib.SendGroupCommand(discoverCtx, session, tunnelCfg.GroupChatID, discover, psk, tunnelCfg.GroupAccessHash); err != nil {
-		discoverCancel()
+	encoded, encErr := soroushlib.EncodeGroupCommand(discover, psk)
+	if encErr != nil {
 		steps = append(steps, TunnelTestStep{
-			Name: "group_discover", Status: "fail", Detail: fmt.Sprintf("Send DISCOVER: %v", err),
+			Name: "group_discover", Status: "fail", Detail: fmt.Sprintf("Encode: %v", encErr),
 			LatencyMs: time.Since(step2Start).Milliseconds(),
 		})
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "steps": steps})
 		return
 	}
+	discBody := soroushlib.BuildSendChannelMessage(tunnelCfg.GroupChatID, tunnelCfg.GroupAccessHash, encoded, time.Now().UnixNano())
+	discoverCtx, discoverCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	_, _, discErr := session.SendAndWait(discoverCtx, discBody, true)
 	discoverCancel()
+	if discErr != nil {
+		steps = append(steps, TunnelTestStep{
+			Name: "group_discover", Status: "fail", Detail: fmt.Sprintf("Send DISCOVER: %v", discErr),
+			LatencyMs: time.Since(step2Start).Milliseconds(),
+		})
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "steps": steps})
+		return
+	}
 	addLog("[TunnelTest] DISCOVER sent to group, waiting for OFFER...", "info")
 
 	// Wait for OFFER response (timeout 30s)
