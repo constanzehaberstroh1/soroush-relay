@@ -12,6 +12,8 @@ import (
 
 	"soroush-relay/soroushlib"
 
+	socks5 "github.com/armon/go-socks5"
+	"github.com/hashicorp/yamux"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -36,6 +38,7 @@ type WorkerConnection struct {
 	PhoneNumber    string
 	PeerConnection *webrtc.PeerConnection
 	DataChannel    *webrtc.DataChannel
+	YamuxSession   *yamux.Session
 	Phase          string // "idle", "connecting", "active"
 	LatencyMs      int64
 	ConnectedAt    time.Time
@@ -378,9 +381,8 @@ func startWorkerListener(ctx context.Context, account *DBSoroushAccount, clientU
 		default:
 		}
 
-		recvCtx, recvCancel := context.WithTimeout(callCtx, 30*time.Second)
-		cid, reader, err := session.Recv(recvCtx)
-		recvCancel()
+		// Use callCtx directly — coder/websocket kills the socket on context expiry
+		cid, reader, err := session.Recv(callCtx)
 
 		if err != nil {
 			if callCtx.Err() != nil {
@@ -495,12 +497,12 @@ func handleIncomingCall(ctx context.Context, session *soroushlib.MTProtoSession,
 				"last_active": "Tunnel active",
 			})
 
-			addLog(fmt.Sprintf("✅ Worker %s: TUNNEL ACTIVE", account.PhoneNumber), "success")
+			addLog(fmt.Sprintf("✅ Worker %s: TUNNEL ACTIVE — SOCKS5 proxy ready", account.PhoneNumber), "success")
+
+			// Start the SOCKS5 proxy server over yamux
+			go startSOCKS5Server(dc, wc, account)
 		})
 
-		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-			handleWorkerMessage(dc, msg, wc, account)
-		})
 
 		dc.OnClose(func() {
 			recordSystemLog(fmt.Sprintf("[Worker %s] Data channel closed", account.PhoneNumber), "warn")
@@ -624,51 +626,56 @@ func handleIncomingCall(ctx context.Context, session *soroushlib.MTProtoSession,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Worker message handler — pulse protocol
+// Worker message handler — SOCKS5 proxy over yamux
 // ──────────────────────────────────────────────────────────────────────────────
 
-type PulseMessage struct {
-	Type      string `json:"type"`
-	Timestamp int64  `json:"timestamp,omitempty"`
-	ClientID  string `json:"client_id,omitempty"`
-	LatencyMs int64  `json:"latency_ms,omitempty"`
-}
+func startSOCKS5Server(dc *webrtc.DataChannel, wc *WorkerConnection, account *DBSoroushAccount) {
+	// Wrap the DataChannel in a stream-oriented adapter
+	dcConn := soroushlib.NewDataChannelConn(dc)
 
-func handleWorkerMessage(dc *webrtc.DataChannel, msg webrtc.DataChannelMessage, wc *WorkerConnection, account *DBSoroushAccount) {
-	var pulse PulseMessage
-	if err := json.Unmarshal(msg.Data, &pulse); err != nil {
-		log.Printf("[Worker %s] Invalid message: %v", account.PhoneNumber, err)
+	// Create a yamux server session (client initiates streams → server accepts)
+	yamuxCfg := yamux.DefaultConfig()
+	yamuxCfg.EnableKeepAlive = true
+	yamuxCfg.KeepAliveInterval = 30 * time.Second
+	yamuxCfg.ConnectionWriteTimeout = 10 * time.Second
+
+	yamuxSession, err := yamux.Server(dcConn, yamuxCfg)
+	if err != nil {
+		recordSystemLog(fmt.Sprintf("[Worker %s] Yamux server init failed: %v", account.PhoneNumber, err), "error")
 		return
 	}
 
-	switch pulse.Type {
-	case "init_pulse":
-		// Calculate latency
-		latency := (time.Now().UnixNano() - pulse.Timestamp) / 1e6
-		if latency < 0 {
-			latency = 0
+	wc.YamuxSession = yamuxSession
+
+	// Create a SOCKS5 server (no auth required — traffic is already encrypted via WebRTC)
+	socks5Conf := &socks5.Config{}
+	socks5Server, err := socks5.New(socks5Conf)
+	if err != nil {
+		recordSystemLog(fmt.Sprintf("[Worker %s] SOCKS5 server init failed: %v", account.PhoneNumber, err), "error")
+		return
+	}
+
+	recordSystemLog(fmt.Sprintf("[Worker %s] SOCKS5 proxy server started over yamux", account.PhoneNumber), "success")
+
+	// Accept incoming yamux streams and serve SOCKS5
+	for {
+		stream, err := yamuxSession.Accept()
+		if err != nil {
+			if yamuxSession.IsClosed() {
+				recordSystemLog(fmt.Sprintf("[Worker %s] Yamux session closed", account.PhoneNumber), "info")
+				return
+			}
+			recordSystemLog(fmt.Sprintf("[Worker %s] Yamux accept error: %v", account.PhoneNumber, err), "error")
+			return
 		}
-		wc.LatencyMs = latency
 
-		recordSystemLog(fmt.Sprintf("[Worker %s] Init pulse from %s. Latency: %dms", account.PhoneNumber, pulse.ClientID, latency), "success")
-
-		// Send ACK
-		ack := PulseMessage{Type: "ack_pulse", LatencyMs: latency}
-		data, _ := json.Marshal(ack)
-		dc.Send(data)
-
-	case "ping":
-		// Reply with pong
-		pong := PulseMessage{Type: "pong", Timestamp: pulse.Timestamp}
-		data, _ := json.Marshal(pong)
-		dc.Send(data)
-
-	case "PING":
-		// Canonical test protocol: echo back the timestamp
-		pong := PulseMessage{Type: "PONG", Timestamp: pulse.Timestamp}
-		data, _ := json.Marshal(pong)
-		dc.Send(data)
-		recordSystemLog(fmt.Sprintf("[Worker %s] PING received, PONG sent (ts=%d)", account.PhoneNumber, pulse.Timestamp), "info")
+		// Each stream is a new SOCKS5 connection from the client
+		go func() {
+			defer stream.Close()
+			if err := socks5Server.ServeConn(stream); err != nil {
+				log.Printf("[Worker %s] SOCKS5 stream error: %v", account.PhoneNumber, err)
+			}
+		}()
 	}
 }
 

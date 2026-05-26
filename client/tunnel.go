@@ -6,14 +6,17 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
 	"sync"
 	"time"
 
 	"soroush-relay/soroushlib"
 
+	"github.com/hashicorp/yamux"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -29,6 +32,8 @@ type TunnelEngine struct {
 	phase          string // "idle", "dispatching", "calling", "connected", "error"
 	peerConnection *webrtc.PeerConnection
 	dataChannel    *webrtc.DataChannel
+	yamuxSession   *yamux.Session
+	socksListener  net.Listener
 	latencyMs      int64
 	lastPingAt     time.Time
 	startedAt      time.Time
@@ -50,17 +55,6 @@ type TunnelEngine struct {
 }
 
 var tunnel = &TunnelEngine{phase: "idle"}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Pulse protocol messages
-// ──────────────────────────────────────────────────────────────────────────────
-
-type PulseMessage struct {
-	Type      string `json:"type"`
-	Timestamp int64  `json:"timestamp,omitempty"`
-	ClientID  string `json:"client_id,omitempty"`
-	LatencyMs int64  `json:"latency_ms,omitempty"`
-}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Start Tunnel — Main orchestration
@@ -109,6 +103,14 @@ func stopTunnel() {
 	tunnel.mu.Lock()
 	if tunnel.cancel != nil {
 		tunnel.cancel()
+	}
+	if tunnel.socksListener != nil {
+		tunnel.socksListener.Close()
+		tunnel.socksListener = nil
+	}
+	if tunnel.yamuxSession != nil {
+		tunnel.yamuxSession.Close()
+		tunnel.yamuxSession = nil
 	}
 	if tunnel.dataChannel != nil {
 		tunnel.dataChannel.Close()
@@ -390,18 +392,8 @@ func establishWebRTC(ctx context.Context, session *soroushlib.MTProtoSession) er
 
 	// ── Data Channel event handlers ──
 	dc.OnOpen(func() {
-		recordSystemLog("[WebRTC] Data channel OPEN! Sending init_pulse...", "success")
+		recordSystemLog("[WebRTC] Data channel OPEN!", "success")
 
-		pulse := PulseMessage{
-			Type:      "init_pulse",
-			Timestamp: time.Now().UnixNano(),
-			ClientID:  "client-01",
-		}
-		data, _ := json.Marshal(pulse)
-		dc.Send(data)
-
-		// Start keepalive ping loop
-		go runPingLoop(ctx, dc)
 
 		tunnel.mu.Lock()
 		tunnel.phase = "connected"
@@ -430,27 +422,9 @@ func establishWebRTC(ctx context.Context, session *soroushlib.MTProtoSession) er
 			soroushlib.SendGroupCommand(connCtx2, csess, gcID, connCmd, gPSK)
 			connCancel2()
 		}
-	})
 
-	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		var pulse PulseMessage
-		if err := json.Unmarshal(msg.Data, &pulse); err != nil {
-			return
-		}
-
-		switch pulse.Type {
-		case "ack_pulse":
-			tunnel.mu.Lock()
-			tunnel.latencyMs = pulse.LatencyMs
-			tunnel.mu.Unlock()
-			recordSystemLog(fmt.Sprintf("[WebRTC] Pulse ACK received! Latency: %dms", pulse.LatencyMs), "success")
-
-		case "pong":
-			latency := time.Since(tunnel.lastPingAt).Milliseconds()
-			tunnel.mu.Lock()
-			tunnel.latencyMs = latency
-			tunnel.mu.Unlock()
-		}
+		// Start local SOCKS5 proxy over yamux
+		go startLocalSOCKS5Proxy(ctx, dc)
 	})
 
 	dc.OnClose(func() {
@@ -701,27 +675,83 @@ type callRecvResult struct {
 	err    error
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Keepalive ping loop
+// Local SOCKS5 proxy — yamux client over DataChannel
 // ──────────────────────────────────────────────────────────────────────────────
 
-func runPingLoop(ctx context.Context, dc *webrtc.DataChannel) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+func startLocalSOCKS5Proxy(ctx context.Context, dc *webrtc.DataChannel) {
+	// Wrap the DataChannel in a stream-oriented adapter
+	dcConn := soroushlib.NewDataChannelConn(dc)
 
+	// Create yamux client session (we initiate streams → server accepts them)
+	yamuxCfg := yamux.DefaultConfig()
+	yamuxCfg.EnableKeepAlive = true
+	yamuxCfg.KeepAliveInterval = 30 * time.Second
+	yamuxCfg.ConnectionWriteTimeout = 10 * time.Second
+
+	yamuxSession, err := yamux.Client(dcConn, yamuxCfg)
+	if err != nil {
+		recordSystemLog(fmt.Sprintf("[SOCKS5] Yamux client init failed: %v", err), "error")
+		return
+	}
+
+	tunnel.mu.Lock()
+	tunnel.yamuxSession = yamuxSession
+	tunnel.mu.Unlock()
+
+	// Start local TCP listener on 127.0.0.1:1080
+	listener, err := net.Listen("tcp", "127.0.0.1:1080")
+	if err != nil {
+		recordSystemLog(fmt.Sprintf("[SOCKS5] Failed to listen on :1080: %v", err), "error")
+		return
+	}
+
+	tunnel.mu.Lock()
+	tunnel.socksListener = listener
+	tunnel.mu.Unlock()
+
+	recordSystemLog("[SOCKS5] Local proxy listening on 127.0.0.1:1080", "success")
+	addLog("🌐 SOCKS5 proxy ready on 127.0.0.1:1080 — configure your browser to use it!", "success")
+
+	// Accept incoming local connections and pipe them through yamux
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			tunnel.lastPingAt = time.Now()
-			ping := PulseMessage{Type: "ping", Timestamp: time.Now().UnixNano()}
-			data, _ := json.Marshal(ping)
-			if err := dc.Send(data); err != nil {
-				log.Printf("[Tunnel] ping send failed: %v", err)
+		localConn, err := listener.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			if yamuxSession.IsClosed() {
+				recordSystemLog("[SOCKS5] Yamux session closed, stopping proxy", "info")
 				return
 			}
+			log.Printf("[SOCKS5] Accept error: %v", err)
+			return
 		}
+
+		go func(conn net.Conn) {
+			defer conn.Close()
+
+			// Open a new yamux stream for this connection
+			stream, err := yamuxSession.Open()
+			if err != nil {
+				log.Printf("[SOCKS5] Yamux stream open failed: %v", err)
+				return
+			}
+			defer stream.Close()
+
+			// Bidirectional pipe: local ↔ yamux stream ↔ DataChannel ↔ server SOCKS5
+			done := make(chan struct{}, 2)
+			go func() {
+				io.Copy(stream, conn)
+				done <- struct{}{}
+			}()
+			go func() {
+				io.Copy(conn, stream)
+				done <- struct{}{}
+			}()
+			<-done
+		}(localConn)
 	}
 }
 

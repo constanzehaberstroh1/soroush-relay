@@ -3,9 +3,11 @@ module soroush-relay
 go 1.26.2
 
 require (
+	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
 	github.com/coder/websocket v1.8.14
 	github.com/glebarez/sqlite v1.11.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
+	github.com/hashicorp/yamux v0.1.2
 	github.com/pion/webrtc/v4 v4.2.13
 	golang.org/x/crypto v0.52.0
 	gorm.io/driver/mysql v1.6.0
