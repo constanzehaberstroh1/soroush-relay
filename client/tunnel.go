@@ -42,6 +42,7 @@ type TunnelEngine struct {
 	// Soroush session for the client account
 	clientSession   *soroushlib.MTProtoSession
 	clientTransport *soroushlib.ObfuscatedTransport
+	clientRouter    *soroushlib.MessageRouter
 
 	// Worker assignment
 	workerUserID    int64
@@ -124,6 +125,7 @@ func stopTunnel() {
 		tunnel.clientTransport.Disconnect()
 		tunnel.clientTransport = nil
 	}
+	tunnel.clientRouter = nil
 	tunnel.phase = "idle"
 	tunnel.latencyMs = 0
 	tunnel.groupChatID = 0
@@ -176,9 +178,21 @@ func runTunnelFlow(ctx context.Context, cancel context.CancelFunc) {
 	connCancel()
 	recordSystemLog("[Tunnel] MTProto transport connected to wss://im-server.splus.ir/apiws", "success")
 
+	// Start MessageRouter
+	router := soroushlib.NewMessageRouter(session)
+	go func() {
+		if err := router.Run(ctx); err != nil {
+			if ctx.Err() == nil {
+				recordSystemLog(fmt.Sprintf("[Tunnel] MessageRouter error: %v", err), "error")
+				setTunnelError(fmt.Sprintf("MessageRouter error: %v", err))
+			}
+		}
+	}()
+
 	tunnel.mu.Lock()
 	tunnel.clientSession = session
 	tunnel.clientTransport = transport
+	tunnel.clientRouter = router
 	tunnel.mu.Unlock()
 
 	// ── Step 4+5: Discovery — Group Bus or Legacy Dispatcher ──
@@ -209,40 +223,43 @@ func runTunnelFlow(ctx context.Context, cancel context.CancelFunc) {
 		}
 		recordSystemLog("[Tunnel] DISCOVER sent ✅", "success")
 
-		// Wait for OFFER
+		// Wait for OFFER using text subscription
 		offerCtx, offerCancel := context.WithTimeout(ctx, 30*time.Second)
-		offerCh := make(chan *soroushlib.GroupCommand, 1)
+		defer offerCancel()
+		textSub := router.SubscribeText()
+		defer router.UnsubscribeText(textSub)
+
+		var offer *soroushlib.GroupCommand
+		offerDone := make(chan bool)
 		go func() {
-			soroushlib.ListenForMessages(offerCtx, session, func(msg soroushlib.IncomingMessage) {
+			for msg := range textSub {
 				if !msg.IsGroup || msg.ChatID != config.GroupChatID || msg.FromUserID == clientAcc.SoroushUserID {
-					return
+					continue
 				}
 				cmd, err := soroushlib.DecodeGroupCommand(msg.Text, psk)
 				if err != nil {
-					return
+					continue
 				}
 				if cmd.Cmd == soroushlib.CmdOffer && cmd.CID == clientID {
-					// Non-blocking send: if multiple servers reply, take first, ignore rest
+					offer = cmd
 					select {
-					case offerCh <- cmd:
+					case offerDone <- true:
 					default:
 					}
+					return
 				}
-			})
+			}
 		}()
 
-		var offer *soroushlib.GroupCommand
 		select {
 		case <-ctx.Done():
-			offerCancel()
 			setTunnelError("Cancelled during discovery")
 			return
 		case <-offerCtx.Done():
-			offerCancel()
 			setTunnelError("No server OFFER received within 30s")
 			return
-		case offer = <-offerCh:
-			offerCancel()
+		case <-offerDone:
+			// Offer received
 		}
 		recordSystemLog(fmt.Sprintf("[Tunnel] OFFER received from server=%s worker_uid=%d", offer.SID, offer.UID), "success")
 
@@ -275,30 +292,39 @@ func runTunnelFlow(ctx context.Context, cancel context.CancelFunc) {
 
 		workerCh := make(chan workerAssignment, 1)
 		listenCtx, listenCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer listenCancel()
+		textSub := router.SubscribeText()
+		defer router.UnsubscribeText(textSub)
+
 		go func() {
-			soroushlib.ListenForMessages(listenCtx, session, func(msg soroushlib.IncomingMessage) {
+			for msg := range textSub {
 				if msg.FromUserID == config.DispatcherUserID {
 					uid, ah, ok := soroushlib.ParseDispatcherResponse(msg.Text)
 					if ok {
-						workerCh <- workerAssignment{userID: uid, accessHash: ah}
+						select {
+						case workerCh <- workerAssignment{userID: uid, accessHash: ah}:
+						default:
+						}
+						return
 					} else if msg.Text == soroushlib.DispatcherNoWorkers {
-						workerCh <- workerAssignment{err: fmt.Errorf("no idle workers")}
+						select {
+						case workerCh <- workerAssignment{err: fmt.Errorf("no idle workers")}:
+						default:
+						}
+						return
 					}
 				}
-			})
+			}
 		}()
 
 		select {
 		case <-ctx.Done():
-			listenCancel()
 			setTunnelError("Cancelled during dispatch")
 			return
 		case <-listenCtx.Done():
-			listenCancel()
 			setTunnelError("Dispatch timeout (30s)")
 			return
 		case wa := <-workerCh:
-			listenCancel()
 			if wa.err != nil {
 				setTunnelError(wa.err.Error())
 				return
@@ -317,7 +343,7 @@ func runTunnelFlow(ctx context.Context, cancel context.CancelFunc) {
 	recordSystemLog(fmt.Sprintf("[Tunnel] Worker assigned: UID=%d. Initiating WebRTC call...", tunnel.workerUserID), "success")
 
 	// ── Step 6: Establish WebRTC connection ──
-	if err := establishWebRTC(ctx, session, &config); err != nil {
+	if err := establishWebRTC(ctx, session, router, &config); err != nil {
 		setTunnelError(fmt.Sprintf("WebRTC failed: %v", err))
 		return
 	}
@@ -333,23 +359,195 @@ type workerAssignment struct {
 // WebRTC Setup — Stealth Voice Call with Data Channel
 // ──────────────────────────────────────────────────────────────────────────────
 
-func establishWebRTC(ctx context.Context, session *soroushlib.MTProtoSession, config *DBTunnelConfig) error {
-	// Build ICE server config from Soroush's TURN servers
-	var iceServers []webrtc.ICEServer
-	for _, srv := range soroushlib.SoroushTURNServers {
-		ice := webrtc.ICEServer{URLs: srv.URLs}
-		if srv.Username != "" {
-			ice.Username = srv.Username
-			ice.Credential = srv.Credential
-			ice.CredentialType = webrtc.ICECredentialTypePassword
+func establishWebRTC(ctx context.Context, session *soroushlib.MTProtoSession, router *soroushlib.MessageRouter, config *DBTunnelConfig) error {
+	tunnel.mu.Lock()
+	clientID := tunnel.clientAccountID
+	serverID := tunnel.serverAccountID
+	groupChatID := tunnel.groupChatID
+	psk := tunnel.groupPSK
+	workerUID := tunnel.workerUserID
+	workerAH := tunnel.workerAccessHash
+	tunnel.mu.Unlock()
+
+	// ── Step 7: Complete Soroush Call Setup ──
+	a, gA, gAHash := generateClientDH()
+
+	randID := make([]byte, 4)
+	rand.Read(randID)
+	randomID := int32(binary.LittleEndian.Uint32(randID))
+
+	callBody := soroushlib.BuildPhoneRequestCall(workerUID, workerAH, randomID, gAHash)
+	recordSystemLog("[Soroush] Sending phone.requestCall to worker...", "info")
+
+	// Subscribe to raw updates BEFORE sending the call request to avoid missing
+	// fast-pushed phoneCallAccepted/confirmed updates (fixes race condition)
+	updateSub := router.SubscribeUpdate()
+	defer router.UnsubscribeUpdate(updateSub)
+
+	// Call request via SendAndWait to get initial CallID and AccessHash
+	callReqCtx, callReqCancel := context.WithTimeout(ctx, 15*time.Second)
+	cid, r, err := session.SendAndWait(callReqCtx, callBody, true)
+	callReqCancel()
+	if err != nil {
+		return fmt.Errorf("send phone.requestCall: %w", err)
+	}
+
+	innerCID, innerReader := unwrapResponse(cid, r, 0)
+	initialCallEvent, err := soroushlib.ParsePhoneCallResult(innerCID, innerReader)
+	if err != nil {
+		return fmt.Errorf("parse requestCall result: %w", err)
+	}
+	if initialCallEvent == nil || initialCallEvent.CallID == 0 {
+		return fmt.Errorf("invalid call event returned from requestCall")
+	}
+
+	callID := initialCallEvent.CallID
+	callAccessHash := initialCallEvent.AccessHash
+	recordSystemLog(fmt.Sprintf("[Soroush] Call requested. CallID=%d, AccessHash=%d", callID, callAccessHash), "info")
+
+	recordSystemLog("[Soroush] Waiting for call to be accepted by worker...", "info")
+	acceptCtx, acceptCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer acceptCancel()
+
+	var gb []byte
+	acceptedDone := make(chan bool, 1)
+
+	go func() {
+		for {
+			select {
+			case <-acceptCtx.Done():
+				return
+			case msg, ok := <-updateSub:
+				if !ok {
+					return
+				}
+				innerCID, innerReader := unwrapResponse(msg.CID, soroushlib.NewTLReader(msg.Data), 0)
+				if innerCID == soroushlib.IDUpdatePhoneCall {
+					callEvent, err := soroushlib.ParseCallUpdate(innerReader)
+					if err != nil || callEvent == nil {
+						continue
+					}
+					if callEvent.CallID == callID && callEvent.Type == "accepted" {
+						gb = callEvent.GB
+						select {
+						case acceptedDone <- true:
+						default:
+						}
+						return
+					}
+				}
+			}
 		}
-		iceServers = append(iceServers, ice)
+	}()
+
+	select {
+	case <-acceptedDone:
+		recordSystemLog("[Soroush] Call accepted by worker. Computing E2E key...", "success")
+	case <-acceptCtx.Done():
+		return fmt.Errorf("timeout waiting for call acceptance")
+	}
+
+	// Compute key fingerprint and confirm the call
+	fingerprint := computeFingerprint(gb, a)
+	confirmBody := soroushlib.BuildPhoneConfirmCall(callID, callAccessHash, gA, fingerprint)
+	recordSystemLog("[Soroush] Sending phone.confirmCall...", "info")
+
+	confirmCtx, confirmCancel := context.WithTimeout(ctx, 15*time.Second)
+	_, _, err = session.SendAndWait(confirmCtx, confirmBody, true)
+	confirmCancel()
+	if err != nil {
+		return fmt.Errorf("send phone.confirmCall: %w", err)
+	}
+
+	// Wait for call confirmation and TURN servers
+	recordSystemLog("[Soroush] Waiting for call confirmation and TURN servers...", "info")
+	confirmWaitCtx, confirmWaitCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer confirmWaitCancel()
+
+	var connections []soroushlib.PhoneConnectionInfo
+	confirmedDone := make(chan bool, 1)
+
+	go func() {
+		for {
+			select {
+			case <-confirmWaitCtx.Done():
+				return
+			case msg, ok := <-updateSub:
+				if !ok {
+					return
+				}
+				innerCID, innerReader := unwrapResponse(msg.CID, soroushlib.NewTLReader(msg.Data), 0)
+				if innerCID == soroushlib.IDUpdatePhoneCall {
+					callEvent, err := soroushlib.ParseCallUpdate(innerReader)
+					if err != nil || callEvent == nil {
+						continue
+					}
+					if callEvent.CallID == callID && (callEvent.Type == "confirmed" || len(callEvent.Connections) > 0) {
+						connections = callEvent.Connections
+						select {
+						case confirmedDone <- true:
+						default:
+						}
+						return
+					}
+				}
+			}
+		}
+	}()
+
+	select {
+	case <-confirmedDone:
+		recordSystemLog(fmt.Sprintf("[Soroush] Call confirmed. Received %d connection endpoints.", len(connections)), "success")
+	case <-confirmWaitCtx.Done():
+		return fmt.Errorf("timeout waiting for call confirmation")
+	}
+
+	// Build ICE server config from Soroush's dynamic TURN servers
+	var iceServers []webrtc.ICEServer
+	for _, conn := range connections {
+		if conn.Turn && conn.Username != "" {
+			turnTCP := fmt.Sprintf("turn:%s:%d?transport=tcp", conn.IP, conn.Port)
+			iceServers = append(iceServers, webrtc.ICEServer{
+				URLs:           []string{turnTCP},
+				Username:       conn.Username,
+				Credential:     conn.Password,
+				CredentialType: webrtc.ICECredentialTypePassword,
+			})
+			turnUDP := fmt.Sprintf("turn:%s:%d", conn.IP, conn.Port)
+			iceServers = append(iceServers, webrtc.ICEServer{
+				URLs:           []string{turnUDP},
+				Username:       conn.Username,
+				Credential:     conn.Password,
+				CredentialType: webrtc.ICECredentialTypePassword,
+			})
+			recordSystemLog(fmt.Sprintf("[WebRTC] Dynamic TURN: %s:%d (user: %s)", conn.IP, conn.Port, conn.Username), "info")
+		} else if conn.Stun {
+			stunURL := fmt.Sprintf("stun:%s:%d", conn.IP, conn.Port)
+			iceServers = append(iceServers, webrtc.ICEServer{
+				URLs: []string{stunURL},
+			})
+		}
+	}
+
+	// Fallback to static SoroushTURNServers if no TURN server with credentials was found
+	if len(iceServers) == 0 {
+		recordSystemLog("[WebRTC] No dynamic TURN credentials received. Falling back to static configuration.", "warn")
+		for _, srv := range soroushlib.SoroushTURNServers {
+			ice := webrtc.ICEServer{URLs: srv.URLs}
+			if srv.Username != "" {
+				ice.Username = srv.Username
+				ice.Credential = srv.Credential
+				ice.CredentialType = webrtc.ICECredentialTypePassword
+			}
+			iceServers = append(iceServers, ice)
+		}
 	}
 
 	configPC := webrtc.Configuration{
-		ICEServers:   iceServers,
-		BundlePolicy: webrtc.BundlePolicyMaxBundle,
-		RTCPMuxPolicy: webrtc.RTCPMuxPolicyRequire,
+		ICEServers:         iceServers,
+		BundlePolicy:       webrtc.BundlePolicyMaxBundle,
+		RTCPMuxPolicy:      webrtc.RTCPMuxPolicyRequire,
+		ICETransportPolicy: webrtc.ICETransportPolicyRelay, // Force TURN relay for censor bypass
 	}
 
 	// Create PeerConnection
@@ -501,184 +699,170 @@ func establishWebRTC(ctx context.Context, session *soroushlib.MTProtoSession, co
 		}
 	})
 
-	// ── Generate SDP Offer (bare, without waiting for ICE gathering) ──
+	// ── Create SDP Offer ──
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
+		pc.Close()
 		return fmt.Errorf("create offer: %w", err)
 	}
 	if err := pc.SetLocalDescription(offer); err != nil {
+		pc.Close()
 		return fmt.Errorf("set local description: %w", err)
 	}
 
-	// NOTE: No GatheringCompletePromise wait! Trickle ICE sends candidates
-	// asynchronously via direct messages after SDP answer is received.
-
-	localDesc := pc.LocalDescription()
-	recordSystemLog(fmt.Sprintf("[WebRTC] SDP Offer generated (%d bytes). Trickle ICE active.", len(localDesc.SDP)), "success")
-
-	// ── Step 7: Send call via Soroush signaling ──
-	// Generate DH parameters for the call encryption handshake
-	gAHash := make([]byte, 32)
-	rand.Read(gAHash)
-
-	randID := make([]byte, 4)
-	rand.Read(randID)
-	randomID := int32(binary.LittleEndian.Uint32(randID))
-
-	tunnel.mu.Lock()
-	workerUID := tunnel.workerUserID
-	workerAH := tunnel.workerAccessHash
-	tunnel.mu.Unlock()
-
-	callBody := soroushlib.BuildPhoneRequestCall(workerUID, workerAH, randomID, gAHash)
-
-	recordSystemLog("[Soroush] Sending phone.requestCall to worker...", "info")
-	callCtx, callCancel := context.WithTimeout(ctx, 15*time.Second)
-
-	// Start listening for call response
-	callRecvCh := make(chan callRecvResult, 1)
-	go func() {
-		cid, reader, err := session.Recv(callCtx)
-		callRecvCh <- callRecvResult{cid: cid, reader: reader, err: err}
-	}()
-
-	_, err = session.Send(callCtx, callBody, true)
-	if err != nil {
-		callCancel()
-		return fmt.Errorf("send phone.requestCall: %w", err)
+	// Wait for ICE gathering to complete to embed relay candidates in SDP Offer
+	recordSystemLog("[WebRTC] Waiting for ICE gathering to complete...", "info")
+	gatherDone := webrtc.GatheringCompletePromise(pc)
+	select {
+	case <-gatherDone:
+		recordSystemLog("[WebRTC] ICE gathering complete. Relay candidates embedded.", "success")
+	case <-time.After(10 * time.Second):
+		recordSystemLog("[WebRTC] ICE gathering timeout (10s), using partial SDP...", "warn")
 	}
 
-	// Wait for call acceptance
-	select {
-	case <-ctx.Done():
-		callCancel()
-		return ctx.Err()
-	case result := <-callRecvCh:
-		callCancel()
-		if result.err != nil {
-			return fmt.Errorf("recv call response: %w", result.err)
-		}
-
-		innerCID, innerReader := unwrapResponse(result.cid, result.reader, 0)
-		callEvent, err := soroushlib.ParsePhoneCallResult(innerCID, innerReader)
-		if err != nil {
-			return fmt.Errorf("parse call result: %w", err)
-		}
-
-		if callEvent != nil {
-			recordSystemLog(fmt.Sprintf("[Soroush] Call event: %s (ID: %d)", callEvent.Type, callEvent.CallID), "success")
-
-			// Apply TURN credentials from call event to PeerConnection
-			if len(callEvent.Connections) > 0 {
-				for _, conn := range callEvent.Connections {
-					if conn.Turn && conn.Username != "" {
-						turnURL := fmt.Sprintf("turn:%s:%d", conn.IP, conn.Port)
-						recordSystemLog(fmt.Sprintf("[WebRTC] Adding TURN: %s (user: %s)", turnURL, conn.Username), "info")
-					}
-				}
-			}
-		}
+	localDesc := pc.LocalDescription()
+	if localDesc == nil {
+		pc.Close()
+		return fmt.Errorf("no local SDP description after gathering")
 	}
 
 	// ── Step 8: Send SDP Offer to worker ──
-	sdpOffer := pc.LocalDescription()
-	if sdpOffer == nil {
-		return fmt.Errorf("no local SDP description")
-	}
-
-	tunnel.mu.Lock()
-	clientID := tunnel.clientAccountID
-	serverID := tunnel.serverAccountID
-	groupChatID := tunnel.groupChatID
-	psk := tunnel.groupPSK
-	tunnel.mu.Unlock()
-
 	if groupChatID != 0 {
-		cmdOffer := soroushlib.NewSDPOffer(clientID, serverID, sdpOffer.SDP)
-		sdpSendCtx, sdpSendCancel := context.WithTimeout(ctx, 10*time.Second)
-		err = soroushlib.SendGroupCommand(sdpSendCtx, session, groupChatID, cmdOffer, psk, config.GroupAccessHash)
-		sdpSendCancel()
-		if err != nil {
-			return fmt.Errorf("send SDP offer to Group Bus: %w", err)
+		// Send chunked SDP offer
+		chunks := soroushlib.ChunkString(localDesc.SDP, 1500)
+		for i, chunk := range chunks {
+			var cmd *soroushlib.GroupCommand
+			if i < len(chunks)-1 {
+				cmd = &soroushlib.GroupCommand{
+					Version:    1,
+					Cmd:        soroushlib.CmdSDPOfferChunk,
+					CID:        clientID,
+					SID:        serverID,
+					Data:       chunk,
+					ChunkIdx:   i,
+					ChunkTotal: len(chunks),
+					Timestamp:  time.Now().UnixMilli(),
+				}
+			} else {
+				cmd = soroushlib.NewSDPOffer(clientID, serverID, chunk)
+				cmd.ChunkIdx = i
+				cmd.ChunkTotal = len(chunks)
+			}
+			sdpSendCtx, sdpSendCancel := context.WithTimeout(ctx, 10*time.Second)
+			err = soroushlib.SendGroupCommand(sdpSendCtx, session, groupChatID, cmd, psk, config.GroupAccessHash)
+			sdpSendCancel()
+			if err != nil {
+				pc.Close()
+				return fmt.Errorf("send SDP offer chunk %d/%d: %w", i+1, len(chunks), err)
+			}
+			time.Sleep(150 * time.Millisecond) // rate limiting
 		}
-		recordSystemLog(fmt.Sprintf("[WebRTC] SDP Offer sent to Group Bus (%d bytes)", len(sdpOffer.SDP)), "success")
+		recordSystemLog(fmt.Sprintf("[WebRTC] Chunked SDP Offer sent to Group Bus (%d bytes, %d chunks)", len(localDesc.SDP), len(chunks)), "success")
 	} else {
 		// Fallback for legacy dispatcher (DMs)
-		offerMsg := soroushlib.FormatSDPOffer(sdpOffer.SDP)
+		offerMsg := soroushlib.FormatSDPOffer(localDesc.SDP)
 		sdpSendCtx, sdpSendCancel := context.WithTimeout(ctx, 10*time.Second)
 		err = soroushlib.SendTextMessage(sdpSendCtx, session, workerUID, workerAH, offerMsg)
 		sdpSendCancel()
 		if err != nil {
+			pc.Close()
 			return fmt.Errorf("send SDP offer: %w", err)
 		}
-		recordSystemLog(fmt.Sprintf("[WebRTC] SDP Offer sent to worker via DM (%d bytes)", len(sdpOffer.SDP)), "success")
+		recordSystemLog(fmt.Sprintf("[WebRTC] SDP Offer sent to worker via DM (%d bytes)", len(localDesc.SDP)), "success")
 	}
 
 	// ── Step 9: Listen for SDP Answer ──
-	sdpAnswerCtx, sdpAnswerCancel := context.WithTimeout(ctx, 30*time.Second)
+	sdpAnswerCtx, sdpAnswerCancel := context.WithTimeout(ctx, 45*time.Second)
 	defer sdpAnswerCancel()
-	answerDone := make(chan bool, 1)
+	answerDone := make(chan string, 1)
+
+	textSub := router.SubscribeText()
+	defer router.UnsubscribeText(textSub)
+
+	assembler := soroushlib.NewSDPAssembler()
 
 	go func() {
-		soroushlib.ListenForMessages(sdpAnswerCtx, session, func(msg soroushlib.IncomingMessage) {
-			if groupChatID != 0 {
-				if !msg.IsGroup || msg.ChatID != groupChatID {
+		for {
+			select {
+			case <-sdpAnswerCtx.Done():
+				return
+			case msg, ok := <-textSub:
+				if !ok {
 					return
 				}
-				cmd, err := soroushlib.DecodeGroupCommand(msg.Text, psk)
-				if err != nil {
-					return
-				}
-				if cmd.CID != clientID || cmd.SID != serverID {
-					return
-				}
+				if groupChatID != 0 {
+					if !msg.IsGroup || msg.ChatID != groupChatID {
+						continue
+					}
+					cmd, err := soroushlib.DecodeGroupCommand(msg.Text, psk)
+					if err != nil {
+						continue
+					}
+					if cmd.CID != clientID || cmd.SID != serverID {
+						continue
+					}
 
-				if cmd.Cmd == soroushlib.CmdSDPAnswer {
-					recordSystemLog(fmt.Sprintf("[WebRTC] Received SDP answer (%d bytes) from Group Bus", len(cmd.Data)), "info")
-					answer := webrtc.SessionDescription{
-						Type: webrtc.SDPTypeAnswer,
-						SDP:  cmd.Data,
+					if cmd.Cmd == soroushlib.CmdSDPAnswerChunk {
+						if fullSDP, complete := assembler.AddChunk(cmd.ChunkIdx, cmd.ChunkTotal, cmd.Data); complete {
+							select {
+							case answerDone <- fullSDP:
+							default:
+							}
+						}
+					} else if cmd.Cmd == soroushlib.CmdSDPAnswer {
+						var complete bool
+						var fullSDP string
+						if cmd.ChunkTotal > 1 {
+							fullSDP, complete = assembler.AddChunk(cmd.ChunkIdx, cmd.ChunkTotal, cmd.Data)
+						} else {
+							fullSDP = cmd.Data
+							complete = true
+						}
+						if complete {
+							select {
+							case answerDone <- fullSDP:
+							default:
+							}
+						}
 					}
-					if err := pc.SetRemoteDescription(answer); err != nil {
-						recordSystemLog(fmt.Sprintf("[WebRTC] SetRemoteDescription failed: %v", err), "error")
-						return
+				} else {
+					// Legacy DM mode
+					if msg.IsGroup || msg.FromUserID != workerUID {
+						continue
 					}
-					recordSystemLog("[WebRTC] Remote description set successfully", "success")
-					answerDone <- true
-				}
-			} else {
-				// Legacy DM mode
-				if msg.IsGroup || msg.FromUserID != workerUID {
-					return
-				}
-				if soroushlib.IsSDPAnswer(msg.Text) {
-					sdpStr := soroushlib.ExtractSDP(msg.Text)
-					recordSystemLog(fmt.Sprintf("[WebRTC] Received SDP answer (%d bytes) from DM", len(sdpStr)), "info")
-					answer := webrtc.SessionDescription{
-						Type: webrtc.SDPTypeAnswer,
-						SDP:  sdpStr,
+					if soroushlib.IsSDPAnswer(msg.Text) {
+						sdpStr := soroushlib.ExtractSDP(msg.Text)
+						select {
+						case answerDone <- sdpStr:
+						default:
+						}
 					}
-					if err := pc.SetRemoteDescription(answer); err != nil {
-						recordSystemLog(fmt.Sprintf("[WebRTC] SetRemoteDescription failed: %v", err), "error")
-						return
-					}
-					recordSystemLog("[WebRTC] Remote description set successfully", "success")
-					answerDone <- true
 				}
 			}
-		})
+		}
 	}()
 
+	var finalSDPAnswer string
 	select {
-	case <-answerDone:
-		recordSystemLog("[WebRTC] SDP Answer negotiation complete!", "success")
+	case finalSDPAnswer = <-answerDone:
+		recordSystemLog("[WebRTC] SDP Answer fully received and assembled!", "success")
 	case <-sdpAnswerCtx.Done():
-		return fmt.Errorf("SDP answer timeout (30s)")
+		pc.Close()
+		return fmt.Errorf("SDP answer timeout (45s)")
 	}
 
-	// ── Step 10: Asynchronously Send and Receive ICE candidates under main ctx ──
+	answer := webrtc.SessionDescription{
+		Type: webrtc.SDPTypeAnswer,
+		SDP:  finalSDPAnswer,
+	}
+	if err := pc.SetRemoteDescription(answer); err != nil {
+		pc.Close()
+		return fmt.Errorf("set remote description: %w", err)
+	}
+	recordSystemLog("[WebRTC] Remote description set successfully", "success")
+
+	// ── Step 10: Asynchronously Send and Receive ICE candidates ──
 	go func() {
-		time.Sleep(500 * time.Millisecond)
 		for {
 			select {
 			case candidate := <-pendingICE:
@@ -699,37 +883,48 @@ func establishWebRTC(ctx context.Context, session *soroushlib.MTProtoSession, co
 		}
 	}()
 
-	// Listen for incoming ICE candidates from worker under main ctx
+	// Listen for incoming ICE candidates from worker using a SEPARATE text subscription
+	// (avoids competing with the SDP answer listener on the same channel)
+	iceTextSub := router.SubscribeText()
 	go func() {
-		soroushlib.ListenForMessages(ctx, session, func(msg soroushlib.IncomingMessage) {
-			if groupChatID != 0 {
-				if !msg.IsGroup || msg.ChatID != groupChatID {
+		defer router.UnsubscribeText(iceTextSub)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case msg, ok := <-iceTextSub:
+				if !ok {
 					return
 				}
-				cmd, err := soroushlib.DecodeGroupCommand(msg.Text, psk)
-				if err != nil {
-					return
-				}
-				if cmd.CID != clientID || cmd.SID != serverID {
-					return
-				}
-				if cmd.Cmd == soroushlib.CmdICE {
-					if err := pc.AddICECandidate(webrtc.ICECandidateInit{Candidate: cmd.Data}); err != nil {
-						recordSystemLog(fmt.Sprintf("[WebRTC] AddICECandidate failed: %v", err), "warn")
+				if groupChatID != 0 {
+					if !msg.IsGroup || msg.ChatID != groupChatID {
+						continue
 					}
-				}
-			} else {
-				if msg.IsGroup || msg.FromUserID != workerUID {
-					return
-				}
-				if soroushlib.IsICECandidate(msg.Text) {
-					candidateStr := soroushlib.ExtractICECandidate(msg.Text)
-					if err := pc.AddICECandidate(webrtc.ICECandidateInit{Candidate: candidateStr}); err != nil {
-						recordSystemLog(fmt.Sprintf("[WebRTC] AddICECandidate failed: %v", err), "warn")
+					cmd, err := soroushlib.DecodeGroupCommand(msg.Text, psk)
+					if err != nil {
+						continue
+					}
+					if cmd.CID != clientID || cmd.SID != serverID {
+						continue
+					}
+					if cmd.Cmd == soroushlib.CmdICE {
+						if err := pc.AddICECandidate(webrtc.ICECandidateInit{Candidate: cmd.Data}); err != nil {
+							recordSystemLog(fmt.Sprintf("[WebRTC] AddICECandidate failed: %v", err), "warn")
+						}
+					}
+				} else {
+					if msg.IsGroup || msg.FromUserID != workerUID {
+						continue
+					}
+					if soroushlib.IsICECandidate(msg.Text) {
+						candidateStr := soroushlib.ExtractICECandidate(msg.Text)
+						if err := pc.AddICECandidate(webrtc.ICECandidateInit{Candidate: candidateStr}); err != nil {
+							recordSystemLog(fmt.Sprintf("[WebRTC] AddICECandidate failed: %v", err), "warn")
+						}
 					}
 				}
 			}
-		})
+		}
 	}()
 
 	recordSystemLog("[WebRTC] Waiting for data channel to open...", "info")
@@ -738,9 +933,13 @@ func establishWebRTC(ctx context.Context, session *soroushlib.MTProtoSession, co
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-time.After(30 * time.Second):
-		if tunnel.phase != "connected" {
-			return fmt.Errorf("data channel open timeout (30s)")
+	case <-time.After(35 * time.Second):
+		tunnel.mu.Lock()
+		isConnected := tunnel.phase == "connected"
+		tunnel.mu.Unlock()
+		if !isConnected {
+			pc.Close()
+			return fmt.Errorf("data channel open timeout (35s)")
 		}
 	}
 
@@ -776,6 +975,54 @@ func startLocalSOCKS5Proxy(ctx context.Context, dc *webrtc.DataChannel) {
 	tunnel.yamuxSession = yamuxSession
 	tunnel.mu.Unlock()
 
+	// Start Yamux-level keepalive and active latency/reconnection monitoring
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if yamuxSession.IsClosed() {
+					recordSystemLog("[SOCKS5] Yamux session closed unexpectedly, triggering reconnect...", "warn")
+					dcConn.Close()
+					return
+				}
+
+				// Measure RTT and verify connection health via active ping
+				rttChan := make(chan time.Duration, 1)
+				errChan := make(chan error, 1)
+				go func() {
+					rtt, err := yamuxSession.Ping()
+					if err != nil {
+						errChan <- err
+					} else {
+						rttChan <- rtt
+					}
+				}()
+
+				select {
+				case rtt := <-rttChan:
+					tunnel.mu.Lock()
+					tunnel.latencyMs = rtt.Milliseconds()
+					tunnel.lastPingAt = time.Now()
+					tunnel.mu.Unlock()
+				case err := <-errChan:
+					recordSystemLog(fmt.Sprintf("[SOCKS5] Yamux keepalive ping failed: %v. Reconnecting...", err), "error")
+					dcConn.Close()
+					return
+				case <-time.After(5 * time.Second):
+					recordSystemLog("[SOCKS5] Yamux keepalive ping timeout (5s). Reconnecting...", "error")
+					dcConn.Close()
+					return
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+
 	// Start local TCP listener on state.socksPort dynamically
 	state.mu.RLock()
 	socksPort := state.socksPort
@@ -792,8 +1039,8 @@ func startLocalSOCKS5Proxy(ctx context.Context, dc *webrtc.DataChannel) {
 	tunnel.socksListener = listener
 	tunnel.mu.Unlock()
 
-	recordSystemLog("[SOCKS5] Local proxy listening on 127.0.0.1:1080", "success")
-	addLog("🌐 SOCKS5 proxy ready on 127.0.0.1:1080 — configure your browser to use it!", "success")
+	recordSystemLog(fmt.Sprintf("[SOCKS5] Local proxy listening on %s", addr), "success")
+	addLog(fmt.Sprintf("🌐 SOCKS5 proxy ready on %s — configure your browser to use it!", addr), "success")
 
 	// Accept incoming local connections and pipe them through yamux
 	for {
@@ -856,18 +1103,15 @@ func setTunnelError(msg string) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// DH helper (for call encryption — generates g_a_hash)
+// DH helper (for call encryption — generates client DH keys and computes fingerprint)
 // ──────────────────────────────────────────────────────────────────────────────
 
-func generateCallDH() (gA []byte, gAHash []byte) {
-	// Generate random 256-byte exponent
+func generateClientDH() (a *big.Int, gA []byte, gAHash []byte) {
 	aBytes := make([]byte, 256)
 	rand.Read(aBytes)
-	a := new(big.Int).SetBytes(aBytes)
+	a = new(big.Int).SetBytes(aBytes)
 
-	// Use g=3, standard DH prime from Telegram
 	g := big.NewInt(3)
-	// Simplified: generate g_a = g^a mod p (using a well-known safe prime)
 	p, _ := new(big.Int).SetString("FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AACAA68FFFFFFFFFFFFFFFF", 16)
 
 	gABig := new(big.Int).Exp(g, a, p)
@@ -877,6 +1121,17 @@ func generateCallDH() (gA []byte, gAHash []byte) {
 
 	gAHash = soroushlib.Sha256Sum(gA)
 	return
+}
+
+func computeFingerprint(gBBytes []byte, a *big.Int) int64 {
+	gB := new(big.Int).SetBytes(gBBytes)
+	p, _ := new(big.Int).SetString("FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AACAA68FFFFFFFFFFFFFFFF", 16)
+	s := new(big.Int).Exp(gB, a, p)
+	sBytes := make([]byte, 256)
+	sBigBytes := s.Bytes()
+	copy(sBytes[256-len(sBigBytes):], sBigBytes)
+	hash := soroushlib.Sha256Sum(sBytes)
+	return int64(binary.LittleEndian.Uint64(hash[0:8]))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

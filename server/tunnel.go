@@ -367,88 +367,115 @@ func startWorkerListener(ctx context.Context, account *DBSoroushAccount, clientU
 	connCancel()
 	defer transport.Disconnect()
 
-	recordSystemLog(fmt.Sprintf("[Worker %s] Connected. Listening for incoming calls...", account.PhoneNumber), "success")
+	// Phase 4: WarmUpSession to sync salt and trigger Soroush messaging backend
+	if err := session.WarmUpSession(ctx); err != nil {
+		recordSystemLog(fmt.Sprintf("[Worker %s] WarmUpSession failed: %v", account.PhoneNumber, err), "warn")
+	}
+
+	// Initialize MessageRouter
+	router := soroushlib.NewMessageRouter(session)
+	go router.Run(ctx)
+
+	recordSystemLog(fmt.Sprintf("[Worker %s] Connected and Router started. Listening for incoming calls...", account.PhoneNumber), "success")
 
 	// Listen for call events
 	callCtx, callCancel := context.WithTimeout(ctx, 60*time.Second)
 	defer callCancel()
+
+	updateSub := router.SubscribeUpdate()
+	defer router.UnsubscribeUpdate(updateSub)
 
 	for {
 		select {
 		case <-callCtx.Done():
 			recordSystemLog(fmt.Sprintf("[Worker %s] Call wait timeout", account.PhoneNumber), "warn")
 			return
-		default:
-		}
-
-		// Use callCtx directly — coder/websocket kills the socket on context expiry
-		cid, reader, err := session.Recv(callCtx)
-
-		if err != nil {
-			if callCtx.Err() != nil {
+		case msg, ok := <-updateSub:
+			if !ok {
 				return
 			}
-			continue
-		}
-
-		// Unwrap to find call events
-		innerCID, innerReader := unwrapResponse(cid, reader, 0)
-
-		if innerCID == soroushlib.IDUpdatePhoneCall {
-			callEvent, err := soroushlib.ParseCallUpdate(innerReader)
-			if err != nil || callEvent == nil {
-				continue
-			}
-
-			if callEvent.Type == "requested" && callEvent.AdminID == clientUserID {
-				recordSystemLog(fmt.Sprintf("[Worker %s] Incoming call from client! CallID=%d", account.PhoneNumber, callEvent.CallID), "success")
-
-				// Accept the call and set up WebRTC
-				if err := handleIncomingCall(ctx, session, account, callEvent); err != nil {
-					recordSystemLog(fmt.Sprintf("[Worker %s] Call handling failed: %v", account.PhoneNumber, err), "error")
+			innerCID, innerReader := unwrapResponse(msg.CID, soroushlib.NewTLReader(msg.Data), 0)
+			if innerCID == soroushlib.IDUpdatePhoneCall {
+				callEvent, err := soroushlib.ParseCallUpdate(innerReader)
+				if err != nil || callEvent == nil {
+					continue
 				}
-				return
+
+				if callEvent.Type == "requested" && callEvent.AdminID == clientUserID {
+					recordSystemLog(fmt.Sprintf("[Worker %s] Incoming call from client! CallID=%d", account.PhoneNumber, callEvent.CallID), "success")
+
+					// Accept call and set up WebRTC
+					if err := handleIncomingCall(ctx, session, router, account, callEvent); err != nil {
+						recordSystemLog(fmt.Sprintf("[Worker %s] Call handling failed: %v", account.PhoneNumber, err), "error")
+					}
+					return
+				}
 			}
 		}
 	}
 }
 
-func handleIncomingCall(ctx context.Context, session *soroushlib.MTProtoSession, account *DBSoroushAccount, callEvent *soroushlib.CallEvent) error {
-	// Acknowledge the call
+func handleIncomingCall(ctx context.Context, session *soroushlib.MTProtoSession, router *soroushlib.MessageRouter, account *DBSoroushAccount, callEvent *soroushlib.CallEvent) error {
+	callCtx, callCancel := context.WithCancel(ctx)
+	defer callCancel()
+
+	// Phase 4: Acknowledge the call (BuildPhoneReceivedCall) wrapped in WrapInitConnection
 	recvBody := soroushlib.BuildPhoneReceivedCall(callEvent.CallID, callEvent.AccessHash)
+	wrappedRecvBody := soroushlib.WrapInitConnection(soroushlib.SoroushAppID, recvBody)
+
 	ackCtx, ackCancel := context.WithTimeout(ctx, 10*time.Second)
-	session.Send(ackCtx, recvBody, true)
+	_, _, err := session.SendAndWait(ackCtx, wrappedRecvBody, true)
 	ackCancel()
+	if err != nil {
+		return fmt.Errorf("send phone.receivedCall: %w", err)
+	}
 
 	// Set up WebRTC PeerConnection (answerer)
 	var iceServers []webrtc.ICEServer
-	for _, srv := range soroushlib.SoroushTURNServers {
-		ice := webrtc.ICEServer{URLs: srv.URLs}
-		if srv.Username != "" {
-			ice.Username = srv.Username
-			ice.Credential = srv.Credential
-			ice.CredentialType = webrtc.ICECredentialTypePassword
-		}
-		iceServers = append(iceServers, ice)
-	}
-
-	// Add TURN servers from call event if available
 	for _, conn := range callEvent.Connections {
 		if conn.Turn && conn.Username != "" {
-			turnURL := fmt.Sprintf("turn:%s:%d", conn.IP, conn.Port)
+			turnTCP := fmt.Sprintf("turn:%s:%d?transport=tcp", conn.IP, conn.Port)
 			iceServers = append(iceServers, webrtc.ICEServer{
-				URLs:           []string{turnURL},
+				URLs:           []string{turnTCP},
 				Username:       conn.Username,
 				Credential:     conn.Password,
 				CredentialType: webrtc.ICECredentialTypePassword,
 			})
+			turnUDP := fmt.Sprintf("turn:%s:%d", conn.IP, conn.Port)
+			iceServers = append(iceServers, webrtc.ICEServer{
+				URLs:           []string{turnUDP},
+				Username:       conn.Username,
+				Credential:     conn.Password,
+				CredentialType: webrtc.ICECredentialTypePassword,
+			})
+			recordSystemLog(fmt.Sprintf("[WebRTC Worker] Dynamic TURN: %s:%d (user: %s)", conn.IP, conn.Port, conn.Username), "info")
+		} else if conn.Stun {
+			stunURL := fmt.Sprintf("stun:%s:%d", conn.IP, conn.Port)
+			iceServers = append(iceServers, webrtc.ICEServer{
+				URLs: []string{stunURL},
+			})
+		}
+	}
+
+	// Fallback to static TURN servers if none provided dynamically
+	if len(iceServers) == 0 {
+		recordSystemLog("[WebRTC Worker] No dynamic TURN credentials received. Falling back to static configuration.", "warn")
+		for _, srv := range soroushlib.SoroushTURNServers {
+			ice := webrtc.ICEServer{URLs: srv.URLs}
+			if srv.Username != "" {
+				ice.Username = srv.Username
+				ice.Credential = srv.Credential
+				ice.CredentialType = webrtc.ICECredentialTypePassword
+			}
+			iceServers = append(iceServers, ice)
 		}
 	}
 
 	config := webrtc.Configuration{
-		ICEServers:    iceServers,
-		BundlePolicy:  webrtc.BundlePolicyMaxBundle,
-		RTCPMuxPolicy: webrtc.RTCPMuxPolicyRequire,
+		ICEServers:         iceServers,
+		BundlePolicy:       webrtc.BundlePolicyMaxBundle,
+		RTCPMuxPolicy:      webrtc.RTCPMuxPolicyRequire,
+		ICETransportPolicy: webrtc.ICETransportPolicyRelay, // Force TURN relay for bypass/censorship
 	}
 
 	pc, err := webrtc.NewPeerConnection(config)
@@ -519,10 +546,14 @@ func handleIncomingCall(ctx context.Context, session *soroushlib.MTProtoSession,
 			"status":      "connected",
 			"last_active": "Tunnel disconnected",
 		})
+		callCancel() // Trigger loop cleanup
 	})
 
 	pc.OnICEConnectionStateChange(func(iceState webrtc.ICEConnectionState) {
 		recordSystemLog(fmt.Sprintf("[Worker %s] ICE: %s", account.PhoneNumber, iceState.String()), "info")
+		if iceState == webrtc.ICEConnectionStateFailed || iceState == webrtc.ICEConnectionStateClosed {
+			callCancel() // Trigger loop cleanup on failure/close
+		}
 	})
 
 	// Accept the call via Soroush signaling
@@ -540,7 +571,7 @@ func handleIncomingCall(ctx context.Context, session *soroushlib.MTProtoSession,
 	defer sdpCancel()
 
 	// Collect ICE candidates to send after SDP answer
-	pendingICE := make(chan string, 32)
+	pendingICE := make(chan string, 100)
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
 			return
@@ -552,110 +583,155 @@ func handleIncomingCall(ctx context.Context, session *soroushlib.MTProtoSession,
 		}
 	})
 
-	sdpDone := make(chan bool, 1)
+	sdpDone := make(chan string, 1)
+
+	textSub := router.SubscribeText()
+	defer router.UnsubscribeText(textSub)
+
+	assembler := soroushlib.NewSDPAssembler()
+
 	go func() {
-		soroushlib.ListenForMessages(sdpCtx, session, func(msg soroushlib.IncomingMessage) {
-			serverTunnel.mu.Lock()
-			groupChatID := serverTunnel.groupChatID
-			psk := serverTunnel.psk
-			groupAccessHash := serverTunnel.groupAccessHash
-			serverTunnel.mu.Unlock()
-
-			adminIDStr := fmt.Sprintf("%d", callEvent.AdminID)
-
-			if groupChatID != 0 {
-				if !msg.IsGroup || msg.ChatID != groupChatID {
+		for {
+			select {
+			case <-sdpCtx.Done():
+				return
+			case msg, ok := <-textSub:
+				if !ok {
 					return
 				}
-				cmd, err := soroushlib.DecodeGroupCommand(msg.Text, psk)
-				if err != nil {
-					return
-				}
-				if cmd.CID != adminIDStr || cmd.SID != account.ID {
-					return
-				}
+				serverTunnel.mu.Lock()
+				groupChatID := serverTunnel.groupChatID
+				psk := serverTunnel.psk
+				serverTunnel.mu.Unlock()
 
-				if cmd.Cmd == soroushlib.CmdSDPOffer {
-					recordSystemLog(fmt.Sprintf("[Worker %s] Received SDP offer (%d bytes) from Group Bus", account.PhoneNumber, len(cmd.Data)), "info")
+				adminIDStr := fmt.Sprintf("%d", callEvent.AdminID)
 
-					offer := webrtc.SessionDescription{
-						Type: webrtc.SDPTypeOffer,
-						SDP:  cmd.Data,
+				if groupChatID != 0 {
+					if !msg.IsGroup || msg.ChatID != groupChatID {
+						continue
 					}
-					if err := pc.SetRemoteDescription(offer); err != nil {
-						recordSystemLog(fmt.Sprintf("[Worker %s] SetRemoteDescription failed: %v", account.PhoneNumber, err), "error")
-						return
-					}
-
-					answer, err := pc.CreateAnswer(nil)
+					cmd, err := soroushlib.DecodeGroupCommand(msg.Text, psk)
 					if err != nil {
-						recordSystemLog(fmt.Sprintf("[Worker %s] CreateAnswer failed: %v", account.PhoneNumber, err), "error")
-						return
+						continue
 					}
-					if err := pc.SetLocalDescription(answer); err != nil {
-						recordSystemLog(fmt.Sprintf("[Worker %s] SetLocalDescription failed: %v", account.PhoneNumber, err), "error")
-						return
+					if cmd.CID != adminIDStr || cmd.SID != account.ID {
+						continue
 					}
 
-					// Send SDP answer back via Group Bus
-					answerCmd := soroushlib.NewSDPAnswer(adminIDStr, account.ID, answer.SDP)
-					sendCtx, sendCancel := context.WithTimeout(ctx, 10*time.Second)
-					err = soroushlib.SendGroupCommand(sendCtx, session, groupChatID, answerCmd, psk, groupAccessHash)
-					sendCancel()
-					if err != nil {
-						recordSystemLog(fmt.Sprintf("[Worker %s] Failed to send SDP Answer: %v", account.PhoneNumber, err), "error")
-						return
+					if cmd.Cmd == soroushlib.CmdSDPOfferChunk {
+						if fullSDP, complete := assembler.AddChunk(cmd.ChunkIdx, cmd.ChunkTotal, cmd.Data); complete {
+							select {
+							case sdpDone <- fullSDP:
+							default:
+							}
+						}
+					} else if cmd.Cmd == soroushlib.CmdSDPOffer {
+						var complete bool
+						var fullSDP string
+						if cmd.ChunkTotal > 1 {
+							fullSDP, complete = assembler.AddChunk(cmd.ChunkIdx, cmd.ChunkTotal, cmd.Data)
+						} else {
+							fullSDP = cmd.Data
+							complete = true
+						}
+						if complete {
+							select {
+							case sdpDone <- fullSDP:
+							default:
+							}
+						}
 					}
-					recordSystemLog(fmt.Sprintf("[Worker %s] SDP answer sent (%d bytes)", account.PhoneNumber, len(answer.SDP)), "success")
-
-					sdpDone <- true
-				}
-			} else {
-				// Legacy DM mode fallback
-				if msg.IsGroup || msg.FromUserID != callEvent.AdminID {
-					return
-				}
-				if soroushlib.IsSDPOffer(msg.Text) {
-					sdpStr := soroushlib.ExtractSDP(msg.Text)
-					recordSystemLog(fmt.Sprintf("[Worker %s] Received SDP offer (%d bytes) from DM", account.PhoneNumber, len(sdpStr)), "info")
-
-					offer := webrtc.SessionDescription{
-						Type: webrtc.SDPTypeOffer,
-						SDP:  sdpStr,
+				} else {
+					// Legacy DM mode fallback
+					if msg.IsGroup || msg.FromUserID != callEvent.AdminID {
+						continue
 					}
-					if err := pc.SetRemoteDescription(offer); err != nil {
-						recordSystemLog(fmt.Sprintf("[Worker %s] SetRemoteDescription failed: %v", account.PhoneNumber, err), "error")
-						return
+					if soroushlib.IsSDPOffer(msg.Text) {
+						sdpStr := soroushlib.ExtractSDP(msg.Text)
+						select {
+						case sdpDone <- sdpStr:
+						default:
+						}
 					}
-
-					answer, err := pc.CreateAnswer(nil)
-					if err != nil {
-						recordSystemLog(fmt.Sprintf("[Worker %s] CreateAnswer failed: %v", account.PhoneNumber, err), "error")
-						return
-					}
-					if err := pc.SetLocalDescription(answer); err != nil {
-						recordSystemLog(fmt.Sprintf("[Worker %s] SetLocalDescription failed: %v", account.PhoneNumber, err), "error")
-						return
-					}
-
-					answerMsg := soroushlib.FormatSDPAnswer(answer.SDP)
-					sendCtx, sendCancel := context.WithTimeout(ctx, 10*time.Second)
-					soroushlib.SendTextMessage(sendCtx, session, callEvent.AdminID, 0, answerMsg)
-					sendCancel()
-					recordSystemLog(fmt.Sprintf("[Worker %s] SDP answer sent (%d bytes)", account.PhoneNumber, len(answer.SDP)), "success")
-
-					sdpDone <- true
 				}
 			}
-		})
+		}
 	}()
 
+	var finalSDPOffer string
 	select {
-	case <-sdpDone:
-		recordSystemLog(fmt.Sprintf("[Worker %s] SDP negotiation complete!", account.PhoneNumber), "success")
+	case finalSDPOffer = <-sdpDone:
+		recordSystemLog(fmt.Sprintf("[Worker %s] SDP offer fully received and assembled!", account.PhoneNumber), "success")
 	case <-sdpCtx.Done():
 		pc.Close()
-		return fmt.Errorf("SDP exchange timed out")
+		return fmt.Errorf("SDP exchange timed out (45s)")
+	}
+
+	offer := webrtc.SessionDescription{
+		Type: webrtc.SDPTypeOffer,
+		SDP:  finalSDPOffer,
+	}
+	if err := pc.SetRemoteDescription(offer); err != nil {
+		pc.Close()
+		return fmt.Errorf("SetRemoteDescription failed: %w", err)
+	}
+
+	answer, err := pc.CreateAnswer(nil)
+	if err != nil {
+		pc.Close()
+		return fmt.Errorf("CreateAnswer failed: %w", err)
+	}
+	if err := pc.SetLocalDescription(answer); err != nil {
+		pc.Close()
+		return fmt.Errorf("SetLocalDescription failed: %w", err)
+	}
+
+	// ── Send SDP answer back (chunked if groupChatID != 0) ──
+	serverTunnel.mu.Lock()
+	groupChatID := serverTunnel.groupChatID
+	psk := serverTunnel.psk
+	groupAccessHash := serverTunnel.groupAccessHash
+	serverTunnel.mu.Unlock()
+
+	adminIDStr := fmt.Sprintf("%d", callEvent.AdminID)
+
+	if groupChatID != 0 {
+		chunks := soroushlib.ChunkString(answer.SDP, 1500)
+		for i, chunk := range chunks {
+			var cmd *soroushlib.GroupCommand
+			if i < len(chunks)-1 {
+				cmd = &soroushlib.GroupCommand{
+					Version:    1,
+					Cmd:        soroushlib.CmdSDPAnswerChunk,
+					CID:        adminIDStr,
+					SID:        account.ID,
+					Data:       chunk,
+					ChunkIdx:   i,
+					ChunkTotal: len(chunks),
+					Timestamp:  time.Now().UnixMilli(),
+				}
+			} else {
+				cmd = soroushlib.NewSDPAnswer(adminIDStr, account.ID, chunk)
+				cmd.ChunkIdx = i
+				cmd.ChunkTotal = len(chunks)
+			}
+			sendCtx, sendCancel := context.WithTimeout(ctx, 10*time.Second)
+			err = soroushlib.SendGroupCommand(sendCtx, session, groupChatID, cmd, psk, groupAccessHash)
+			sendCancel()
+			if err != nil {
+				pc.Close()
+				return fmt.Errorf("failed to send SDP Answer chunk %d/%d: %w", i+1, len(chunks), err)
+			}
+			time.Sleep(150 * time.Millisecond) // rate limiting
+		}
+		recordSystemLog(fmt.Sprintf("[Worker %s] SDP answer sent (%d bytes, %d chunks)", account.PhoneNumber, len(answer.SDP), len(chunks)), "success")
+	} else {
+		// Legacy DM mode fallback
+		answerMsg := soroushlib.FormatSDPAnswer(answer.SDP)
+		sendCtx, sendCancel := context.WithTimeout(ctx, 10*time.Second)
+		soroushlib.SendTextMessage(sendCtx, session, callEvent.AdminID, 0, answerMsg)
+		sendCancel()
+		recordSystemLog(fmt.Sprintf("[Worker %s] SDP answer sent via DM (%d bytes)", account.PhoneNumber, len(answer.SDP)), "success")
 	}
 
 	// ── Send buffered ICE candidates asynchronously under main ctx ──
@@ -689,49 +765,59 @@ func handleIncomingCall(ctx context.Context, session *soroushlib.MTProtoSession,
 		}
 	}()
 
-	// ── Listen for incoming ICE candidates under main ctx ──
+	// ── Listen for incoming ICE candidates using a SEPARATE text subscription ──
+	// (avoids competing with the SDP offer listener on the same channel)
+	iceTextSub := router.SubscribeText()
 	go func() {
-		soroushlib.ListenForMessages(ctx, session, func(msg soroushlib.IncomingMessage) {
-			serverTunnel.mu.Lock()
-			groupChatID := serverTunnel.groupChatID
-			psk := serverTunnel.psk
-			serverTunnel.mu.Unlock()
-
-			adminIDStr := fmt.Sprintf("%d", callEvent.AdminID)
-
-			if groupChatID != 0 {
-				if !msg.IsGroup || msg.ChatID != groupChatID {
+		defer router.UnsubscribeText(iceTextSub)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case msg, ok := <-iceTextSub:
+				if !ok {
 					return
 				}
-				cmd, err := soroushlib.DecodeGroupCommand(msg.Text, psk)
-				if err != nil {
-					return
-				}
-				if cmd.CID != adminIDStr || cmd.SID != account.ID {
-					return
-				}
+				serverTunnel.mu.Lock()
+				groupChatID := serverTunnel.groupChatID
+				psk := serverTunnel.psk
+				serverTunnel.mu.Unlock()
 
-				if cmd.Cmd == soroushlib.CmdICE {
-					if err := pc.AddICECandidate(webrtc.ICECandidateInit{Candidate: cmd.Data}); err != nil {
-						recordSystemLog(fmt.Sprintf("[Worker %s] AddICECandidate failed: %v", account.PhoneNumber, err), "warn")
+				adminIDStr := fmt.Sprintf("%d", callEvent.AdminID)
+
+				if groupChatID != 0 {
+					if !msg.IsGroup || msg.ChatID != groupChatID {
+						continue
 					}
-				}
-			} else {
-				if msg.IsGroup || msg.FromUserID != callEvent.AdminID {
-					return
-				}
-				if soroushlib.IsICECandidate(msg.Text) {
-					candidateStr := soroushlib.ExtractICECandidate(msg.Text)
-					if err := pc.AddICECandidate(webrtc.ICECandidateInit{Candidate: candidateStr}); err != nil {
-						recordSystemLog(fmt.Sprintf("[Worker %s] AddICECandidate failed: %v", account.PhoneNumber, err), "warn")
+					cmd, err := soroushlib.DecodeGroupCommand(msg.Text, psk)
+					if err != nil {
+						continue
+					}
+					if cmd.CID != adminIDStr || cmd.SID != account.ID {
+						continue
+					}
+					if cmd.Cmd == soroushlib.CmdICE {
+						if err := pc.AddICECandidate(webrtc.ICECandidateInit{Candidate: cmd.Data}); err != nil {
+							recordSystemLog(fmt.Sprintf("[Worker %s] AddICECandidate failed: %v", account.PhoneNumber, err), "warn")
+						}
+					}
+				} else {
+					if msg.IsGroup || msg.FromUserID != callEvent.AdminID {
+						continue
+					}
+					if soroushlib.IsICECandidate(msg.Text) {
+						candidateStr := soroushlib.ExtractICECandidate(msg.Text)
+						if err := pc.AddICECandidate(webrtc.ICECandidateInit{Candidate: candidateStr}); err != nil {
+							recordSystemLog(fmt.Sprintf("[Worker %s] AddICECandidate failed: %v", account.PhoneNumber, err), "warn")
+						}
 					}
 				}
 			}
-		})
+		}
 	}()
 
-	// Keep the worker alive until context is cancelled
-	<-ctx.Done()
+	// Keep worker alive until context is cancelled
+	<-callCtx.Done()
 	pc.Close()
 	return nil
 }

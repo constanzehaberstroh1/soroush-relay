@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,6 +25,8 @@ const (
 	CmdSDPOffer   = "SDP_OFFER"
 	CmdSDPAnswer  = "SDP_ANSWER"
 	CmdICE        = "ICE"
+	CmdSDPOfferChunk  = "SDP_OFFER_CHUNK"
+	CmdSDPAnswerChunk = "SDP_ANSWER_CHUNK"
 )
 
 // GroupCommand represents a structured command sent through the group chat
@@ -37,6 +41,8 @@ type GroupCommand struct {
 	Timestamp  int64  `json:"ts,omitempty"`   // Unix timestamp in milliseconds
 	Latency    int64  `json:"lat,omitempty"`  // Latency in ms (for CONNECTED)
 	Data       string `json:"data,omitempty"` // Arbitrary payload (SDP or ICE candidate)
+	ChunkIdx   int    `json:"ci,omitempty"`   // Chunk index (0-based)
+	ChunkTotal int    `json:"ct,omitempty"`   // Total chunks
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -225,4 +231,48 @@ type ServerInfo struct {
 // IsAlive returns true if the server was seen within the given timeout
 func (s *ServerInfo) IsAlive(timeout time.Duration) bool {
 	return time.Since(s.LastSeen) < timeout
+}
+
+// ChunkString splits a string into chunks of maximum size maxLen
+func ChunkString(s string, maxLen int) []string {
+	var chunks []string
+	runes := []rune(s)
+	for i := 0; i < len(runes); i += maxLen {
+		end := i + maxLen
+		if end > len(runes) {
+			end = len(runes)
+		}
+		chunks = append(chunks, string(runes[i:end]))
+	}
+	return chunks
+}
+
+// SDPAssembler aggregates chunked SDP command payloads
+type SDPAssembler struct {
+	mu     sync.Mutex
+	chunks map[int]string
+	total  int
+}
+
+// NewSDPAssembler creates a new SDPAssembler
+func NewSDPAssembler() *SDPAssembler {
+	return &SDPAssembler{
+		chunks: make(map[int]string),
+	}
+}
+
+// AddChunk adds a chunk and returns the full string if all chunks have been received
+func (a *SDPAssembler) AddChunk(idx int, total int, data string) (string, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.total = total
+	a.chunks[idx] = data
+	if len(a.chunks) == total {
+		var sb strings.Builder
+		for i := 0; i < total; i++ {
+			sb.WriteString(a.chunks[i])
+		}
+		return sb.String(), true
+	}
+	return "", false
 }
