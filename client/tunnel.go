@@ -168,6 +168,9 @@ func runTunnelFlow(ctx context.Context, cancel context.CancelFunc) {
 	// ── Step 3: Connect to Soroush and restore session ──
 	recordSystemLog("[Tunnel] Connecting to Soroush MTProto...", "info")
 	session, transport := soroushlib.RestoreSession(clientAcc.AuthKey, clientAcc.AuthKeyID, clientAcc.ServerSalt)
+	session.Logger = func(msg string, level string) {
+		recordSystemLog(msg, level)
+	}
 
 	connCtx, connCancel := context.WithTimeout(ctx, 15*time.Second)
 	if err := transport.Connect(connCtx); err != nil {

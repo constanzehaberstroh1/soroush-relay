@@ -159,6 +159,9 @@ func runGroupObserverOnce(ctx context.Context) error {
 	recordSystemLog(fmt.Sprintf("[GroupObserver] Starting with account: %s (UID: %d)", account.PhoneNumber, account.SoroushUserID), "info")
 
 	session, transport := soroushlib.RestoreSession(account.AuthKey, account.AuthKeyID, account.ServerSalt)
+	session.Logger = func(msg string, level string) {
+		recordSystemLog(msg, level)
+	}
 
 	connCtx, connCancel := context.WithTimeout(ctx, 15*time.Second)
 	if err := transport.Connect(connCtx); err != nil {
