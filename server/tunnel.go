@@ -253,7 +253,11 @@ func runGroupObserverOnce(ctx context.Context) error {
 				if !ok {
 					return
 				}
-				recordSystemLog(fmt.Sprintf("[GroupObserver] Received message: ChatID=%d, FromUID=%d, IsGroup=%t, TextLen=%d", msg.ChatID, msg.FromUserID, msg.IsGroup, len(msg.Text)), "info")
+				// Ignore historical messages older than 30 seconds
+				if msg.Date != 0 && time.Now().Unix()-int64(msg.Date) > 30 {
+					continue
+				}
+				recordSystemLog(fmt.Sprintf("[GroupObserver] Received message: ChatID=%d, FromUID=%d, IsGroup=%t, TextLen=%d, Date=%d", msg.ChatID, msg.FromUserID, msg.IsGroup, len(msg.Text), msg.Date), "info")
 				if !msg.IsGroup || msg.ChatID != chatID {
 					continue
 				}

@@ -637,16 +637,17 @@ func parseUpdateNewMessage(r *TLReader, session *MTProtoSession, handler func(ms
 	}
 
 	// date
-	r.ReadInt32()
+	date, _ := r.ReadInt32()
 
 	// message text
 	text, _ := r.ReadString()
 
 	if fromUserID != 0 {
-		session.Log(fmt.Sprintf("[Messaging] parseUpdateNewMessage: Parsed ID=%d FromUserID=%d ChatID=%d Text=%s", msgID, fromUserID, chatID, truncate(text, 40)), "info")
+		session.Log(fmt.Sprintf("[Messaging] parseUpdateNewMessage: Parsed ID=%d FromUserID=%d ChatID=%d Text=%s Date=%d", msgID, fromUserID, chatID, truncate(text, 40), date), "info")
 		handler(IncomingMessage{
 			FromUserID: fromUserID,
 			Text:       text,
+			Date:       date,
 			MessageID:  msgID,
 			ChatID:     chatID,
 			IsGroup:    isGroup,

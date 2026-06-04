@@ -328,7 +328,11 @@ func runTunnelFlow(ctx context.Context, cancel context.CancelFunc) {
 
 		go func() {
 			for msg := range textSub {
-				recordSystemLog(fmt.Sprintf("[Tunnel] Subscription received msg: ChatID=%d FromUID=%d Text=%s", msg.ChatID, msg.FromUserID, msg.Text), "info")
+				// Ignore historical messages older than 30 seconds
+				if msg.Date != 0 && time.Now().Unix()-int64(msg.Date) > 30 {
+					continue
+				}
+				recordSystemLog(fmt.Sprintf("[Tunnel] Subscription received msg: ChatID=%d FromUID=%d Text=%s Date=%d", msg.ChatID, msg.FromUserID, msg.Text, msg.Date), "info")
 				if !msg.IsGroup || msg.ChatID != config.GroupChatID || msg.FromUserID == clientAcc.SoroushUserID {
 					continue
 				}

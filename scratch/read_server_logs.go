@@ -3,16 +3,18 @@ package main
 import (
 	"fmt"
 	"log"
+	"time"
 
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
 
 type DBLogEntry struct {
-	ID        uint   `gorm:"primaryKey"`
-	Timestamp string `gorm:"column:timestamp"`
-	Type      string `gorm:"size:20"`
-	Message   string `gorm:"type:text"`
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	Timestamp string    `json:"timestamp"`
+	Type      string    `json:"type"` // "info", "warn", "error", "success"
+	Message   string    `gorm:"type:text" json:"message"`
+	CreatedAt time.Time `json:"createdAt"`
 }
 
 func main() {
@@ -22,13 +24,11 @@ func main() {
 		log.Fatalf("Failed to connect: %v", err)
 	}
 
+	fmt.Println("=== SERVER LOG ENTRIES (Last 100) ===")
 	var logs []DBLogEntry
-	if err := db.Order("id desc").Limit(200).Find(&logs).Error; err != nil {
-		log.Fatalf("failed to query: %v", err)
-	}
-
-	fmt.Println("=== SERVER LOGS FROM MYSQL ===")
-	for _, l := range logs {
-		fmt.Printf("[%d] [%s] [%s] %s\n", l.ID, l.Timestamp, l.Type, l.Message)
+	db.Order("id desc").Limit(100).Find(&logs)
+	for i := len(logs) - 1; i >= 0; i-- {
+		l := logs[i]
+		fmt.Printf("[%s] [%s] %s\n", l.CreatedAt.Format("15:04:05"), l.Type, l.Message)
 	}
 }
