@@ -633,6 +633,9 @@ func parseUpdateNewMessage(r *TLReader, session *MTProtoSession, handler func(ms
 		r.ReadInt64()
 	}
 
+	// date
+	r.ReadInt32()
+
 	// message text
 	text, _ := r.ReadString()
 
