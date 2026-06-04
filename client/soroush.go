@@ -354,6 +354,23 @@ type recvResult struct {
 }
 
 func unwrapResponse(cid uint32, r *soroushlib.TLReader, expectedMsgID int64) (uint32, *soroushlib.TLReader) {
+	// Proactively scan remaining bytes for nested IDUpdatePhoneCall (0xAB0F6B1E)
+	remLen := r.Remaining()
+	fullData := r.GetData()
+	currentPos := len(fullData) - remLen
+	if currentPos >= 0 && currentPos <= len(fullData) {
+		data := fullData[currentPos:]
+		for i := 0; i <= len(data)-8; i++ {
+			uCID := uint32(data[i]) | uint32(data[i+1])<<8 | uint32(data[i+2])<<16 | uint32(data[i+3])<<24
+			if uCID == soroushlib.IDUpdatePhoneCall {
+				nextCID := uint32(data[i+4]) | uint32(data[i+5])<<8 | uint32(data[i+6])<<16 | uint32(data[i+7])<<24
+				if nextCID == 0x14B0ED0C || nextCID == 0x3660C311 || nextCID == 0x967F7C67 || nextCID == 0x50CA4DE1 || nextCID == 0xC5226F17 {
+					return soroushlib.IDUpdatePhoneCall, soroushlib.NewTLReader(data[i+4:])
+				}
+			}
+		}
+	}
+
 	switch cid {
 	case soroushlib.IDRPCResult:
 		r.ReadInt64()
