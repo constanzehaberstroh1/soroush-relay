@@ -365,9 +365,13 @@ func runTunnelFlow(ctx context.Context, cancel context.CancelFunc) {
 		// Send CALLING to group to lock this server
 		calling := soroushlib.NewCalling(clientID, offer.SID)
 		callCtx2, callCancel2 := context.WithTimeout(ctx, 10*time.Second)
-		soroushlib.SendGroupCommand(callCtx2, session, config.GroupChatID, calling, psk, config.GroupAccessHash)
+		err = soroushlib.SendGroupCommand(callCtx2, session, config.GroupChatID, calling, psk, config.GroupAccessHash)
 		callCancel2()
-		recordSystemLog(fmt.Sprintf("[Tunnel] CALLING sent for server %s", offer.SID), "info")
+		if err != nil {
+			recordSystemLog(fmt.Sprintf("[Tunnel] Failed to send CALLING to group: %v", err), "error")
+		} else {
+			recordSystemLog(fmt.Sprintf("[Tunnel] CALLING sent for server %s", offer.SID), "info")
+		}
 
 		tunnel.mu.Lock()
 		tunnel.workerUserID = offer.UID

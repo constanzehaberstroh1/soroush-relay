@@ -667,6 +667,9 @@ func parseUpdates(r *TLReader, session *MTProtoSession, handler func(msg Incomin
 		session.Log(fmt.Sprintf("[Messaging] parseUpdates: item %d/%d updateCID=0x%08X", i+1, count, updateCID), "info")
 		if updateCID == IDUpdateNewMessage || updateCID == IDUpdateNewChannelMessage {
 			parseUpdateNewMessage(r, session, handler)
+		} else if updateCID == 0x3DED6320 {
+			// Skip updateReadChannelInbox / updateReadChannelOutbox body (8 bytes)
+			r.ReadInt64()
 		}
 		// Skip other update types gracefully
 	}

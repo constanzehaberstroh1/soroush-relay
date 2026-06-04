@@ -383,9 +383,17 @@ func startWorkerListener(ctx context.Context, account *DBSoroushAccount, clientU
 	connCancel()
 	defer transport.Disconnect()
 
-	// Phase 4: WarmUpSession to sync salt and trigger Soroush messaging backend
-	if err := session.WarmUpSession(ctx); err != nil {
-		recordSystemLog(fmt.Sprintf("[Worker %s] WarmUpSession failed: %v", account.PhoneNumber, err), "warn")
+	// Phase 4: Initialize connection and subscribe to updates by fetching dialogs (getDialogs) wrapped in initConnection.
+	initBody := soroushlib.BuildGetDialogsRequest()
+	wrappedInit := soroushlib.WrapInitConnection(soroushlib.SoroushAppID, initBody)
+
+	initCtx, initCancel := context.WithTimeout(ctx, 30*time.Second)
+	_, _, err := session.SendAndWait(initCtx, wrappedInit, true)
+	initCancel()
+	if err != nil {
+		recordSystemLog(fmt.Sprintf("[Worker %s] Connection initialization (getDialogs) failed: %v", account.PhoneNumber, err), "warn")
+	} else {
+		recordSystemLog(fmt.Sprintf("[Worker %s] Connection initialized and dialog list loaded ✅", account.PhoneNumber), "success")
 	}
 
 	// Initialize MessageRouter
