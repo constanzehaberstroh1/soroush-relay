@@ -481,36 +481,43 @@ func handleIncomingCall(ctx context.Context, session *soroushlib.MTProtoSession,
 	serverTunnel.activeWorkers[account.ID] = wc
 	serverTunnel.mu.Unlock()
 
-	// Handle incoming data channel
-	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		recordSystemLog(fmt.Sprintf("[Worker %s] Data channel '%s' received", account.PhoneNumber, dc.Label()), "success")
+	ordered := true
+	negotiated := true
+	var dcID uint16 = 0
+	dc, err := pc.CreateDataChannel("data", &webrtc.DataChannelInit{
+		Ordered:    &ordered,
+		Negotiated: &negotiated,
+		ID:         &dcID,
+	})
+	if err != nil {
+		pc.Close()
+		return fmt.Errorf("create data channel: %w", err)
+	}
 
-		wc.DataChannel = dc
+	wc.DataChannel = dc
 
-		dc.OnOpen(func() {
-			recordSystemLog(fmt.Sprintf("[Worker %s] Data channel OPEN!", account.PhoneNumber), "success")
-			wc.Phase = "active"
-			wc.ConnectedAt = time.Now()
+	dc.OnOpen(func() {
+		recordSystemLog(fmt.Sprintf("[Worker %s] Data channel OPEN!", account.PhoneNumber), "success")
+		wc.Phase = "active"
+		wc.ConnectedAt = time.Now()
 
-			db.Model(account).Updates(map[string]interface{}{
-				"status":      "tunnel_active",
-				"last_active": "Tunnel active",
-			})
-
-			addLog(fmt.Sprintf("✅ Worker %s: TUNNEL ACTIVE — SOCKS5 proxy ready", account.PhoneNumber), "success")
-
-			// Start the SOCKS5 proxy server over yamux
-			go startSOCKS5Server(dc, wc, account)
+		db.Model(account).Updates(map[string]interface{}{
+			"status":      "tunnel_active",
+			"last_active": "Tunnel active",
 		})
 
+		addLog(fmt.Sprintf("✅ Worker %s: TUNNEL ACTIVE — SOCKS5 proxy ready", account.PhoneNumber), "success")
 
-		dc.OnClose(func() {
-			recordSystemLog(fmt.Sprintf("[Worker %s] Data channel closed", account.PhoneNumber), "warn")
-			wc.Phase = "idle"
-			db.Model(account).Updates(map[string]interface{}{
-				"status":      "connected",
-				"last_active": "Tunnel disconnected",
-			})
+		// Start the SOCKS5 proxy server over yamux
+		go startSOCKS5Server(dc, wc, account)
+	})
+
+	dc.OnClose(func() {
+		recordSystemLog(fmt.Sprintf("[Worker %s] Data channel closed", account.PhoneNumber), "warn")
+		wc.Phase = "idle"
+		db.Model(account).Updates(map[string]interface{}{
+			"status":      "connected",
+			"last_active": "Tunnel disconnected",
 		})
 	})
 
@@ -528,7 +535,7 @@ func handleIncomingCall(ctx context.Context, session *soroushlib.MTProtoSession,
 
 	recordSystemLog(fmt.Sprintf("[Worker %s] Call accepted. Waiting for SDP offer...", account.PhoneNumber), "info")
 
-	// ── SDP Exchange: Listen for SDP_OFFER from client via direct message ──
+	// ── SDP Exchange: Listen for SDP_OFFER from client via Group Bus ──
 	sdpCtx, sdpCancel := context.WithTimeout(ctx, 45*time.Second)
 	defer sdpCancel()
 
@@ -545,67 +552,99 @@ func handleIncomingCall(ctx context.Context, session *soroushlib.MTProtoSession,
 		}
 	})
 
-	// Listen for SDP offer + ICE candidates from client
 	sdpDone := make(chan bool, 1)
 	go func() {
 		soroushlib.ListenForMessages(sdpCtx, session, func(msg soroushlib.IncomingMessage) {
-			if msg.IsGroup || msg.FromUserID != callEvent.AdminID {
-				return
-			}
+			serverTunnel.mu.Lock()
+			groupChatID := serverTunnel.groupChatID
+			psk := serverTunnel.psk
+			groupAccessHash := serverTunnel.groupAccessHash
+			serverTunnel.mu.Unlock()
 
-			if soroushlib.IsSDPOffer(msg.Text) {
-				sdpStr := soroushlib.ExtractSDP(msg.Text)
-				recordSystemLog(fmt.Sprintf("[Worker %s] Received SDP offer (%d bytes)", account.PhoneNumber, len(sdpStr)), "info")
+			adminIDStr := fmt.Sprintf("%d", callEvent.AdminID)
 
-				offer := webrtc.SessionDescription{
-					Type: webrtc.SDPTypeOffer,
-					SDP:  sdpStr,
-				}
-				if err := pc.SetRemoteDescription(offer); err != nil {
-					recordSystemLog(fmt.Sprintf("[Worker %s] SetRemoteDescription failed: %v", account.PhoneNumber, err), "error")
+			if groupChatID != 0 {
+				if !msg.IsGroup || msg.ChatID != groupChatID {
 					return
 				}
-
-				answer, err := pc.CreateAnswer(nil)
+				cmd, err := soroushlib.DecodeGroupCommand(msg.Text, psk)
 				if err != nil {
-					recordSystemLog(fmt.Sprintf("[Worker %s] CreateAnswer failed: %v", account.PhoneNumber, err), "error")
 					return
 				}
-				if err := pc.SetLocalDescription(answer); err != nil {
-					recordSystemLog(fmt.Sprintf("[Worker %s] SetLocalDescription failed: %v", account.PhoneNumber, err), "error")
+				if cmd.CID != adminIDStr || cmd.SID != account.ID {
 					return
 				}
 
-				// Send SDP answer back via direct message
-				answerMsg := soroushlib.FormatSDPAnswer(answer.SDP)
-				sendCtx, sendCancel := context.WithTimeout(sdpCtx, 10*time.Second)
-				soroushlib.SendTextMessage(sendCtx, session, callEvent.AdminID, 0, answerMsg)
-				sendCancel()
-				recordSystemLog(fmt.Sprintf("[Worker %s] SDP answer sent (%d bytes)", account.PhoneNumber, len(answer.SDP)), "success")
+				if cmd.Cmd == soroushlib.CmdSDPOffer {
+					recordSystemLog(fmt.Sprintf("[Worker %s] Received SDP offer (%d bytes) from Group Bus", account.PhoneNumber, len(cmd.Data)), "info")
 
-				// Send buffered ICE candidates (context-managed, no premature timeout)
-				go func() {
-					time.Sleep(500 * time.Millisecond)
-					for {
-						select {
-						case candidate := <-pendingICE:
-							iceMsg := soroushlib.FormatICECandidate(candidate)
-							iceCtx, iceCancel := context.WithTimeout(sdpCtx, 5*time.Second)
-							soroushlib.SendTextMessage(iceCtx, session, callEvent.AdminID, 0, iceMsg)
-							iceCancel()
-						case <-sdpCtx.Done():
-							return
-						}
+					offer := webrtc.SessionDescription{
+						Type: webrtc.SDPTypeOffer,
+						SDP:  cmd.Data,
 					}
-				}()
+					if err := pc.SetRemoteDescription(offer); err != nil {
+						recordSystemLog(fmt.Sprintf("[Worker %s] SetRemoteDescription failed: %v", account.PhoneNumber, err), "error")
+						return
+					}
 
-				sdpDone <- true
-			}
+					answer, err := pc.CreateAnswer(nil)
+					if err != nil {
+						recordSystemLog(fmt.Sprintf("[Worker %s] CreateAnswer failed: %v", account.PhoneNumber, err), "error")
+						return
+					}
+					if err := pc.SetLocalDescription(answer); err != nil {
+						recordSystemLog(fmt.Sprintf("[Worker %s] SetLocalDescription failed: %v", account.PhoneNumber, err), "error")
+						return
+					}
 
-			if soroushlib.IsICECandidate(msg.Text) {
-				candidateStr := soroushlib.ExtractICECandidate(msg.Text)
-				if err := pc.AddICECandidate(webrtc.ICECandidateInit{Candidate: candidateStr}); err != nil {
-					recordSystemLog(fmt.Sprintf("[Worker %s] AddICECandidate failed: %v", account.PhoneNumber, err), "warn")
+					// Send SDP answer back via Group Bus
+					answerCmd := soroushlib.NewSDPAnswer(adminIDStr, account.ID, answer.SDP)
+					sendCtx, sendCancel := context.WithTimeout(ctx, 10*time.Second)
+					err = soroushlib.SendGroupCommand(sendCtx, session, groupChatID, answerCmd, psk, groupAccessHash)
+					sendCancel()
+					if err != nil {
+						recordSystemLog(fmt.Sprintf("[Worker %s] Failed to send SDP Answer: %v", account.PhoneNumber, err), "error")
+						return
+					}
+					recordSystemLog(fmt.Sprintf("[Worker %s] SDP answer sent (%d bytes)", account.PhoneNumber, len(answer.SDP)), "success")
+
+					sdpDone <- true
+				}
+			} else {
+				// Legacy DM mode fallback
+				if msg.IsGroup || msg.FromUserID != callEvent.AdminID {
+					return
+				}
+				if soroushlib.IsSDPOffer(msg.Text) {
+					sdpStr := soroushlib.ExtractSDP(msg.Text)
+					recordSystemLog(fmt.Sprintf("[Worker %s] Received SDP offer (%d bytes) from DM", account.PhoneNumber, len(sdpStr)), "info")
+
+					offer := webrtc.SessionDescription{
+						Type: webrtc.SDPTypeOffer,
+						SDP:  sdpStr,
+					}
+					if err := pc.SetRemoteDescription(offer); err != nil {
+						recordSystemLog(fmt.Sprintf("[Worker %s] SetRemoteDescription failed: %v", account.PhoneNumber, err), "error")
+						return
+					}
+
+					answer, err := pc.CreateAnswer(nil)
+					if err != nil {
+						recordSystemLog(fmt.Sprintf("[Worker %s] CreateAnswer failed: %v", account.PhoneNumber, err), "error")
+						return
+					}
+					if err := pc.SetLocalDescription(answer); err != nil {
+						recordSystemLog(fmt.Sprintf("[Worker %s] SetLocalDescription failed: %v", account.PhoneNumber, err), "error")
+						return
+					}
+
+					answerMsg := soroushlib.FormatSDPAnswer(answer.SDP)
+					sendCtx, sendCancel := context.WithTimeout(ctx, 10*time.Second)
+					soroushlib.SendTextMessage(sendCtx, session, callEvent.AdminID, 0, answerMsg)
+					sendCancel()
+					recordSystemLog(fmt.Sprintf("[Worker %s] SDP answer sent (%d bytes)", account.PhoneNumber, len(answer.SDP)), "success")
+
+					sdpDone <- true
 				}
 			}
 		})
@@ -618,6 +657,78 @@ func handleIncomingCall(ctx context.Context, session *soroushlib.MTProtoSession,
 		pc.Close()
 		return fmt.Errorf("SDP exchange timed out")
 	}
+
+	// ── Send buffered ICE candidates asynchronously under main ctx ──
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		for {
+			select {
+			case candidate := <-pendingICE:
+				serverTunnel.mu.Lock()
+				groupChatID := serverTunnel.groupChatID
+				psk := serverTunnel.psk
+				groupAccessHash := serverTunnel.groupAccessHash
+				serverTunnel.mu.Unlock()
+
+				adminIDStr := fmt.Sprintf("%d", callEvent.AdminID)
+
+				if groupChatID != 0 {
+					cmdICE := soroushlib.NewICE(adminIDStr, account.ID, candidate)
+					iceCtx, iceCancel := context.WithTimeout(ctx, 5*time.Second)
+					soroushlib.SendGroupCommand(iceCtx, session, groupChatID, cmdICE, psk, groupAccessHash)
+					iceCancel()
+				} else {
+					iceMsg := soroushlib.FormatICECandidate(candidate)
+					iceCtx, iceCancel := context.WithTimeout(ctx, 5*time.Second)
+					soroushlib.SendTextMessage(iceCtx, session, callEvent.AdminID, 0, iceMsg)
+					iceCancel()
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// ── Listen for incoming ICE candidates under main ctx ──
+	go func() {
+		soroushlib.ListenForMessages(ctx, session, func(msg soroushlib.IncomingMessage) {
+			serverTunnel.mu.Lock()
+			groupChatID := serverTunnel.groupChatID
+			psk := serverTunnel.psk
+			serverTunnel.mu.Unlock()
+
+			adminIDStr := fmt.Sprintf("%d", callEvent.AdminID)
+
+			if groupChatID != 0 {
+				if !msg.IsGroup || msg.ChatID != groupChatID {
+					return
+				}
+				cmd, err := soroushlib.DecodeGroupCommand(msg.Text, psk)
+				if err != nil {
+					return
+				}
+				if cmd.CID != adminIDStr || cmd.SID != account.ID {
+					return
+				}
+
+				if cmd.Cmd == soroushlib.CmdICE {
+					if err := pc.AddICECandidate(webrtc.ICECandidateInit{Candidate: cmd.Data}); err != nil {
+						recordSystemLog(fmt.Sprintf("[Worker %s] AddICECandidate failed: %v", account.PhoneNumber, err), "warn")
+					}
+				}
+			} else {
+				if msg.IsGroup || msg.FromUserID != callEvent.AdminID {
+					return
+				}
+				if soroushlib.IsICECandidate(msg.Text) {
+					candidateStr := soroushlib.ExtractICECandidate(msg.Text)
+					if err := pc.AddICECandidate(webrtc.ICECandidateInit{Candidate: candidateStr}); err != nil {
+						recordSystemLog(fmt.Sprintf("[Worker %s] AddICECandidate failed: %v", account.PhoneNumber, err), "warn")
+					}
+				}
+			}
+		})
+	}()
 
 	// Keep the worker alive until context is cancelled
 	<-ctx.Done()

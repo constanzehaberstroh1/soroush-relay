@@ -1,8 +1,10 @@
 package main
 
 import (
+	"crypto/rand"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"github.com/glebarez/sqlite"
@@ -71,26 +73,44 @@ func initDB() {
 	seedAdmin()
 }
 
-// Seed the default admin credential (salman / 136517)
+// Seed the default admin credential (salman / ADMIN_PASSWORD env or random/fallback)
 func seedAdmin() {
 	var count int64
 	db.Model(&DBAdmin{}).Count(&count)
 	if count == 0 {
-		hashedPassword, err := bcrypt.GenerateFromPassword([]byte("136517"), bcrypt.DefaultCost)
+		adminUser := os.Getenv("ADMIN_USERNAME")
+		if adminUser == "" {
+			adminUser = "salman"
+		}
+		adminPass := os.Getenv("ADMIN_PASSWORD")
+		if adminPass == "" {
+			bytes := make([]byte, 8)
+			if _, err := rand.Read(bytes); err == nil {
+				adminPass = fmt.Sprintf("%x", bytes)
+				log.Printf("[DB] WARNING: ADMIN_PASSWORD env variable not set. Generated random admin password: %s\n", adminPass)
+			} else {
+				adminPass = "136517"
+				log.Println("[DB] WARNING: Failed to generate random password, using fallback '136517'")
+			}
+		} else {
+			log.Printf("[DB] Seeding admin user '%s' using ADMIN_PASSWORD from environment\n", adminUser)
+		}
+
+		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(adminPass), bcrypt.DefaultCost)
 		if err != nil {
 			log.Fatalf("[DB] Failed to hash password: %v", err)
 		}
 
 		admin := DBAdmin{
-			Username:     "salman",
+			Username:     adminUser,
 			PasswordHash: string(hashedPassword),
 			CreatedAt:    time.Now(),
 		}
 
 		if err := db.Create(&admin).Error; err != nil {
-			log.Fatalf("[DB] Failed to seed default admin user: %v", err)
+			log.Fatalf("[DB] Failed to seed admin user: %v", err)
 		}
-		fmt.Println("[DB] Successfully seeded default admin user (salman / 136517)")
+		fmt.Printf("[DB] Successfully seeded admin user (%s / %s)\n", adminUser, adminPass)
 	} else {
 		fmt.Println("[DB] Admin credentials already seeded.")
 	}

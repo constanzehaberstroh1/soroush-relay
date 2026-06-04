@@ -20,6 +20,9 @@ const (
 	CmdCalling    = "CALLING"
 	CmdConnected  = "CONNECTED"
 	CmdDisconnect = "DISCONNECT"
+	CmdSDPOffer   = "SDP_OFFER"
+	CmdSDPAnswer  = "SDP_ANSWER"
+	CmdICE        = "ICE"
 )
 
 // GroupCommand represents a structured command sent through the group chat
@@ -33,6 +36,7 @@ type GroupCommand struct {
 	Load       int    `json:"load,omitempty"` // Current load (for HEARTBEAT)
 	Timestamp  int64  `json:"ts,omitempty"`   // Unix timestamp in milliseconds
 	Latency    int64  `json:"lat,omitempty"`  // Latency in ms (for CONNECTED)
+	Data       string `json:"data,omitempty"` // Arbitrary payload (SDP or ICE candidate)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -104,6 +108,42 @@ func NewDisconnect(id string) *GroupCommand {
 		Version:   1,
 		Cmd:       CmdDisconnect,
 		SID:       id,
+		Timestamp: time.Now().UnixMilli(),
+	}
+}
+
+// NewSDPOffer creates an SDP Offer command
+func NewSDPOffer(clientID, serverID, sdp string) *GroupCommand {
+	return &GroupCommand{
+		Version:   1,
+		Cmd:       CmdSDPOffer,
+		CID:       clientID,
+		SID:       serverID,
+		Data:      sdp,
+		Timestamp: time.Now().UnixMilli(),
+	}
+}
+
+// NewSDPAnswer creates an SDP Answer command
+func NewSDPAnswer(clientID, serverID, sdp string) *GroupCommand {
+	return &GroupCommand{
+		Version:   1,
+		Cmd:       CmdSDPAnswer,
+		CID:       clientID,
+		SID:       serverID,
+		Data:      sdp,
+		Timestamp: time.Now().UnixMilli(),
+	}
+}
+
+// NewICE creates an ICE candidate command
+func NewICE(clientID, serverID, candidate string) *GroupCommand {
+	return &GroupCommand{
+		Version:   1,
+		Cmd:       CmdICE,
+		CID:       clientID,
+		SID:       serverID,
+		Data:      candidate,
 		Timestamp: time.Now().UnixMilli(),
 	}
 }

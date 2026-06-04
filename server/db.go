@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"fmt"
 	"log"
 	"os"
@@ -49,30 +50,18 @@ type DBGroupConfig struct {
 	PSK             string `gorm:"size:191" json:"psk"` // Pre-shared key for stealth encoding
 }
 
-// Initialize MySQL database for server exit node (with fallback configurations)
+// Initialize MySQL database for server exit node (no fallbacks for security)
 func initDB() {
 	var err error
 
-	// Read environment variables (Clever Cloud injected) or fall back to provided credentials
 	host := os.Getenv("MYSQL_ADDON_HOST")
-	if host == "" {
-		host = "bqgalqe1hnsoyltraetp-mysql.services.clever-cloud.com"
-	}
 	port := os.Getenv("MYSQL_ADDON_PORT")
-	if port == "" {
-		port = "3306"
-	}
 	user := os.Getenv("MYSQL_ADDON_USER")
-	if user == "" {
-		user = "ubbjvpmkfqpwo1ku"
-	}
 	password := os.Getenv("MYSQL_ADDON_PASSWORD")
-	if password == "" {
-		password = "gJ1RsKBEuzuh0rm5qIl6"
-	}
 	dbname := os.Getenv("MYSQL_ADDON_DB")
-	if dbname == "" {
-		dbname = "bqgalqe1hnsoyltraetp"
+
+	if host == "" || port == "" || user == "" || password == "" || dbname == "" {
+		log.Fatal("[DB] Missing required MySQL environment variables (MYSQL_ADDON_HOST, MYSQL_ADDON_PORT, MYSQL_ADDON_USER, MYSQL_ADDON_PASSWORD, MYSQL_ADDON_DB)")
 	}
 
 	// Construct standardized MySQL DSN
@@ -100,26 +89,44 @@ func initDB() {
 	seedAdmin()
 }
 
-// Seed default admin user (salman / 136517)
+// Seed default admin user (salman / ADMIN_PASSWORD env or random/fallback)
 func seedAdmin() {
 	var count int64
 	db.Model(&DBAdmin{}).Count(&count)
 	if count == 0 {
-		hashedPassword, err := bcrypt.GenerateFromPassword([]byte("136517"), bcrypt.DefaultCost)
+		adminUser := os.Getenv("ADMIN_USERNAME")
+		if adminUser == "" {
+			adminUser = "salman"
+		}
+		adminPass := os.Getenv("ADMIN_PASSWORD")
+		if adminPass == "" {
+			bytes := make([]byte, 8)
+			if _, err := rand.Read(bytes); err == nil {
+				adminPass = fmt.Sprintf("%x", bytes)
+				log.Printf("[DB] WARNING: ADMIN_PASSWORD env variable not set. Generated random admin password: %s\n", adminPass)
+			} else {
+				adminPass = "136517"
+				log.Println("[DB] WARNING: Failed to generate random password, using fallback '136517'")
+			}
+		} else {
+			log.Printf("[DB] Seeding admin user '%s' using ADMIN_PASSWORD from environment\n", adminUser)
+		}
+
+		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(adminPass), bcrypt.DefaultCost)
 		if err != nil {
 			log.Fatalf("[DB] Failed to hash password: %v", err)
 		}
 
 		admin := DBAdmin{
-			Username:     "salman",
+			Username:     adminUser,
 			PasswordHash: string(hashedPassword),
 			CreatedAt:    time.Now(),
 		}
 
 		if err := db.Create(&admin).Error; err != nil {
-			log.Fatalf("[DB] Failed to seed default admin user: %v", err)
+			log.Fatalf("[DB] Failed to seed admin user: %v", err)
 		}
-		fmt.Println("[DB] Successfully seeded default admin user (salman / 136517)")
+		fmt.Printf("[DB] Successfully seeded admin user (%s / %s)\n", adminUser, adminPass)
 	} else {
 		fmt.Println("[DB] Admin credentials already seeded.")
 	}

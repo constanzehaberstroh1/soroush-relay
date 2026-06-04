@@ -1,9 +1,11 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -12,7 +14,19 @@ import (
 )
 
 // JWT signing key
-var jwtSecret = []byte("soroush-relay-secure-jwt-token-2026")
+var jwtSecret []byte
+
+func init() {
+	secret := os.Getenv("JWT_SECRET")
+	if secret == "" {
+		jwtSecret = make([]byte, 32)
+		if _, err := rand.Read(jwtSecret); err != nil {
+			panic("failed to generate random jwt secret: " + err.Error())
+		}
+	} else {
+		jwtSecret = []byte(secret)
+	}
+}
 
 // JWT Claims structure
 type Claims struct {

@@ -1,103 +1,119 @@
 package soroushlib
 
 import (
-	"io"
+	"net"
 	"sync"
+	"time"
 
 	"github.com/pion/webrtc/v4"
 )
 
-// DataChannelConn wraps a WebRTC DataChannel to implement io.ReadWriteCloser.
+// DataChannelConn wraps a WebRTC DataChannel to implement net.Conn.
 // This allows stream-oriented protocols (like yamux) to multiplex over the
 // message-oriented DataChannel.
 type DataChannelConn struct {
 	dc     *webrtc.DataChannel
-	readCh chan []byte // incoming messages buffered here
-	buf    []byte     // partial read buffer
-	closed bool
-	mu     sync.Mutex
+	buf    chan []byte
+	rem    []byte
+	closed chan struct{}
+	once   sync.Once
 }
 
 // NewDataChannelConn creates a new DataChannelConn adapter.
 // It registers an OnMessage handler on the DataChannel to buffer incoming data.
-// IMPORTANT: Call this BEFORE any other OnMessage handler is set on the dc.
 func NewDataChannelConn(dc *webrtc.DataChannel) *DataChannelConn {
-	conn := &DataChannelConn{
+	c := &DataChannelConn{
 		dc:     dc,
-		readCh: make(chan []byte, 256), // buffer up to 256 messages
+		buf:    make(chan []byte, 512),
+		closed: make(chan struct{}),
 	}
-
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		conn.mu.Lock()
-		if conn.closed {
-			conn.mu.Unlock()
-			return
-		}
-		conn.mu.Unlock()
-
-		// Non-blocking send to channel
+		data := make([]byte, len(msg.Data))
+		copy(data, msg.Data)
 		select {
-		case conn.readCh <- msg.Data:
-		default:
-			// Drop if buffer is full (backpressure)
+		case c.buf <- data:
+		case <-c.closed:
 		}
 	})
-
 	dc.OnClose(func() {
-		conn.mu.Lock()
-		conn.closed = true
-		conn.mu.Unlock()
-		close(conn.readCh)
+		c.Close()
 	})
-
-	return conn
+	return c
 }
 
-// Read implements io.Reader. Blocks until data is available.
-func (c *DataChannelConn) Read(p []byte) (int, error) {
-	// First, drain any leftover bytes from a previous partial read
-	if len(c.buf) > 0 {
-		n := copy(p, c.buf)
-		c.buf = c.buf[n:]
+// Read implements net.Conn. Blocks until data is available.
+func (c *DataChannelConn) Read(b []byte) (int, error) {
+	if len(c.rem) > 0 {
+		n := copy(b, c.rem)
+		c.rem = c.rem[n:]
 		return n, nil
 	}
-
-	// Wait for next message
-	data, ok := <-c.readCh
-	if !ok {
-		return 0, io.EOF
+	select {
+	case data, ok := <-c.buf:
+		if !ok {
+			return 0, net.ErrClosed
+		}
+		n := copy(b, data)
+		if n < len(data) {
+			c.rem = data[n:]
+		}
+		return n, nil
+	case <-c.closed:
+		return 0, net.ErrClosed
 	}
-
-	n := copy(p, data)
-	if n < len(data) {
-		// Store leftover for next Read
-		c.buf = data[n:]
-	}
-	return n, nil
 }
 
-// Write implements io.Writer. Sends data as a DataChannel message.
-func (c *DataChannelConn) Write(p []byte) (int, error) {
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return 0, io.ErrClosedPipe
-	}
-	c.mu.Unlock()
-
-	if err := c.dc.Send(p); err != nil {
+// Write implements net.Conn. Sends data as a DataChannel message.
+func (c *DataChannelConn) Write(b []byte) (int, error) {
+	chunk := make([]byte, len(b))
+	copy(chunk, b)
+	if err := c.dc.Send(chunk); err != nil {
 		return 0, err
 	}
-	return len(p), nil
+	return len(b), nil
 }
 
-// Close implements io.Closer.
+// Close implements net.Conn.
 func (c *DataChannelConn) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed {
-		return nil
-	}
-	c.closed = true
+	c.once.Do(func() {
+		close(c.closed)
+	})
 	return c.dc.Close()
 }
+
+// LocalAddr implements net.Conn.
+func (c *DataChannelConn) LocalAddr() net.Addr {
+	return dcAddr("local")
+}
+
+// RemoteAddr implements net.Conn.
+func (c *DataChannelConn) RemoteAddr() net.Addr {
+	return dcAddr("remote")
+}
+
+// SetDeadline implements net.Conn (no-op).
+func (c *DataChannelConn) SetDeadline(t time.Time) error {
+	return nil
+}
+
+// SetReadDeadline implements net.Conn (no-op).
+func (c *DataChannelConn) SetReadDeadline(t time.Time) error {
+	return nil
+}
+
+// SetWriteDeadline implements net.Conn (no-op).
+func (c *DataChannelConn) SetWriteDeadline(t time.Time) error {
+	return nil
+}
+
+type dcAddr string
+
+func (a dcAddr) Network() string {
+	return "datachannel"
+}
+
+func (a dcAddr) String() string {
+	return string(a)
+}
+
+var _ net.Conn = (*DataChannelConn)(nil)
