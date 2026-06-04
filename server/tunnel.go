@@ -229,55 +229,79 @@ func runGroupObserverOnce(ctx context.Context) error {
 	pingTicker := time.NewTicker(20 * time.Second)
 	defer pingTicker.Stop()
 
+	// Use MessageRouter instead of ListenForMessages so that both the group text
+	// listener AND the call update listener (in startWorkerListener) can receive
+	// events from the SAME session. ListenForMessages exclusively consumed
+	// session.updateCh and discarded non-text updates like updatePhoneCall,
+	// causing the worker to never see the incoming call event.
+	router := soroushlib.NewMessageRouter(session)
+
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- soroushlib.ListenForMessages(ctx, session, func(msg soroushlib.IncomingMessage) {
-			if !msg.IsGroup || msg.ChatID != chatID {
-				return
-			}
-			if msg.FromUserID == account.SoroushUserID {
-				return
-			}
+		errCh <- router.Run(ctx)
+	}()
 
-			cmd, err := soroushlib.DecodeGroupCommand(msg.Text, psk)
-			if err != nil {
+	textSub := router.SubscribeText()
+	defer router.UnsubscribeText(textSub)
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
 				return
-			}
-
-			recordSystemLog(fmt.Sprintf("[GroupObserver] Received %s from UID=%d", cmd.Cmd, msg.FromUserID), "info")
-
-			switch cmd.Cmd {
-			case soroushlib.CmdDiscover:
-				lastReplied, ok := repliedDiscovers[cmd.CID]
-				if ok && time.Since(lastReplied) < 3*time.Second {
+			case msg, ok := <-textSub:
+				if !ok {
 					return
 				}
-				repliedDiscovers[cmd.CID] = time.Now()
-
-				go func(targetCID string) {
-					delay := time.Duration(2000+rand.Intn(2000)) * time.Millisecond
-					time.Sleep(delay)
-
-					offer := soroushlib.NewOffer(targetCID, serverID, account.SoroushUserID, account.AccessHash)
-					offerCtx, offerCancel := context.WithTimeout(ctx, 10*time.Second)
-					defer offerCancel()
-					if err := soroushlib.SendGroupCommand(offerCtx, session, chatID, offer, psk, chatAH); err != nil {
-						recordSystemLog(fmt.Sprintf("[GroupObserver] Failed to send OFFER: %v", err), "error")
-					} else {
-						recordSystemLog(fmt.Sprintf("[GroupObserver] Sent OFFER to client %s", targetCID), "success")
-					}
-				}(cmd.CID)
-
-			case soroushlib.CmdCalling:
-				if cmd.SID == serverID {
-					recordSystemLog(fmt.Sprintf("[GroupObserver] Client %s is CALLING us!", cmd.CID), "success")
-					go startWorkerListener(ctx, &account, msg.FromUserID)
+				if !msg.IsGroup || msg.ChatID != chatID {
+					continue
+				}
+				if msg.FromUserID == account.SoroushUserID {
+					continue
 				}
 
-			case soroushlib.CmdDisconnect:
-				recordSystemLog(fmt.Sprintf("[GroupObserver] DISCONNECT from %s", cmd.SID), "info")
+				cmd, err := soroushlib.DecodeGroupCommand(msg.Text, psk)
+				if err != nil {
+					continue
+				}
+
+				recordSystemLog(fmt.Sprintf("[GroupObserver] Received %s from UID=%d", cmd.Cmd, msg.FromUserID), "info")
+
+				switch cmd.Cmd {
+				case soroushlib.CmdDiscover:
+					lastReplied, ok := repliedDiscovers[cmd.CID]
+					if ok && time.Since(lastReplied) < 3*time.Second {
+						continue
+					}
+					repliedDiscovers[cmd.CID] = time.Now()
+
+					go func(targetCID string) {
+						delay := time.Duration(2000+rand.Intn(2000)) * time.Millisecond
+						time.Sleep(delay)
+
+						offer := soroushlib.NewOffer(targetCID, serverID, account.SoroushUserID, account.AccessHash)
+						offerCtx, offerCancel := context.WithTimeout(ctx, 10*time.Second)
+						defer offerCancel()
+						if err := soroushlib.SendGroupCommand(offerCtx, session, chatID, offer, psk, chatAH); err != nil {
+							recordSystemLog(fmt.Sprintf("[GroupObserver] Failed to send OFFER: %v", err), "error")
+						} else {
+							recordSystemLog(fmt.Sprintf("[GroupObserver] Sent OFFER to client %s", targetCID), "success")
+						}
+					}(cmd.CID)
+
+				case soroushlib.CmdCalling:
+					if cmd.SID == serverID {
+						recordSystemLog(fmt.Sprintf("[GroupObserver] Client %s is CALLING us!", cmd.CID), "success")
+						// Pass the SAME session and router so the worker receives
+						// updatePhoneCall events on the already-connected session.
+						go startWorkerListener(ctx, session, router, &account, msg.FromUserID)
+					}
+
+				case soroushlib.CmdDisconnect:
+					recordSystemLog(fmt.Sprintf("[GroupObserver] DISCONNECT from %s", cmd.SID), "info")
+				}
 			}
-		})
+		}
 	}()
 
 	for {
@@ -302,7 +326,7 @@ func runGroupObserverOnce(ctx context.Context) error {
 			}
 		case err := <-errCh:
 			if err != nil && ctx.Err() == nil {
-				recordSystemLog(fmt.Sprintf("[GroupObserver] Listen error: %v", err), "error")
+				recordSystemLog(fmt.Sprintf("[GroupObserver] Router error: %v", err), "error")
 				return err
 			}
 			return nil
@@ -329,20 +353,34 @@ func runDispatcher(ctx context.Context) {
 	connCancel()
 	defer transport.Disconnect()
 
+	session.StartReader(ctx)
+
 	serverTunnel.mu.Lock()
 	serverTunnel.dispatcherReady = true
 	serverTunnel.mu.Unlock()
 
-	soroushlib.ListenForMessages(ctx, session, func(msg soroushlib.IncomingMessage) {
-		if msg.Text == soroushlib.DispatcherSynRequest {
-			handleDispatchRequest(ctx, session, msg.FromUserID, &dispatcherAcc)
-		}
-	})
+	router := soroushlib.NewMessageRouter(session)
+	go router.Run(ctx)
 
-	transport.Disconnect()
+	textSub := router.SubscribeText()
+	defer router.UnsubscribeText(textSub)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg, ok := <-textSub:
+			if !ok {
+				return
+			}
+			if msg.Text == soroushlib.DispatcherSynRequest {
+				handleDispatchRequest(ctx, session, router, msg.FromUserID, &dispatcherAcc)
+			}
+		}
+	}
 }
 
-func handleDispatchRequest(ctx context.Context, session *soroushlib.MTProtoSession, clientUserID int64, dispatcherAcc *DBSoroushAccount) {
+func handleDispatchRequest(ctx context.Context, session *soroushlib.MTProtoSession, router *soroushlib.MessageRouter, clientUserID int64, dispatcherAcc *DBSoroushAccount) {
 	var workerAcc DBSoroushAccount
 	if err := db.Where("role = ? AND status = ?", "worker", "connected").First(&workerAcc).Error; err != nil {
 		sendCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -355,14 +393,14 @@ func handleDispatchRequest(ctx context.Context, session *soroushlib.MTProtoSessi
 	sendCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	soroushlib.SendTextMessage(sendCtx, session, clientUserID, 0, response)
 	cancel()
-	go startWorkerListener(ctx, &workerAcc, clientUserID)
+	go startWorkerListener(ctx, session, router, &workerAcc, clientUserID)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Worker — listens for incoming WebRTC call and sets up data channel
 // ──────────────────────────────────────────────────────────────────────────────
 
-func startWorkerListener(ctx context.Context, account *DBSoroushAccount, clientUserID int64) {
+func startWorkerListener(ctx context.Context, session *soroushlib.MTProtoSession, router *soroushlib.MessageRouter, account *DBSoroushAccount, clientUserID int64) {
 	defer func() {
 		if r := recover(); r != nil {
 			recordSystemLog(fmt.Sprintf("[Worker %s] Panic: %v", account.PhoneNumber, r), "error")
@@ -370,42 +408,9 @@ func startWorkerListener(ctx context.Context, account *DBSoroushAccount, clientU
 		db.Model(account).Update("status", "connected")
 	}()
 
-	recordSystemLog(fmt.Sprintf("[Worker %s] Waiting for incoming call from UserID=%d...", account.PhoneNumber, clientUserID), "info")
+	recordSystemLog(fmt.Sprintf("[Worker %s] Listening for incoming call from UserID=%d on shared session...", account.PhoneNumber, clientUserID), "info")
 
-	// Connect worker to Soroush
-	session, transport := soroushlib.RestoreSession(account.AuthKey, account.AuthKeyID, account.ServerSalt)
-
-	connCtx, connCancel := context.WithTimeout(ctx, 15*time.Second)
-	if err := transport.Connect(connCtx); err != nil {
-		connCancel()
-		recordSystemLog(fmt.Sprintf("[Worker %s] Transport connect failed: %v", account.PhoneNumber, err), "error")
-		return
-	}
-	connCancel()
-	defer transport.Disconnect()
-
-	session.StartReader(ctx)
-
-	// Phase 4: Initialize connection and subscribe to updates by fetching dialogs (getDialogs) wrapped in initConnection.
-	initBody := soroushlib.BuildGetDialogsRequest()
-	wrappedInit := soroushlib.WrapInitConnection(soroushlib.SoroushAppID, initBody)
-
-	initCtx, initCancel := context.WithTimeout(ctx, 30*time.Second)
-	_, _, err := session.SendAndWait(initCtx, wrappedInit, true)
-	initCancel()
-	if err != nil {
-		recordSystemLog(fmt.Sprintf("[Worker %s] Connection initialization (getDialogs) failed: %v", account.PhoneNumber, err), "warn")
-	} else {
-		recordSystemLog(fmt.Sprintf("[Worker %s] Connection initialized and dialog list loaded ✅", account.PhoneNumber), "success")
-	}
-
-	// Initialize MessageRouter
-	router := soroushlib.NewMessageRouter(session)
-	go router.Run(ctx)
-
-	recordSystemLog(fmt.Sprintf("[Worker %s] Connected and Router started. Listening for incoming calls...", account.PhoneNumber), "success")
-
-	// Listen for call events
+	// Listen for call events on the shared router (same session as group observer)
 	callCtx, callCancel := context.WithTimeout(ctx, 60*time.Second)
 	defer callCancel()
 

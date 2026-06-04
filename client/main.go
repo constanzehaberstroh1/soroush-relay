@@ -212,6 +212,16 @@ func main() {
 	fmt.Printf(" Soroush WebRTC Relay CLIENT Panel launched on http://%s\n", addr)
 	fmt.Println("==========================================================")
 
+	go func() {
+		time.Sleep(2 * time.Second)
+		log.Println("[AutoStart] Triggering tunnel start...")
+		if err := startTunnel(); err != nil {
+			log.Printf("[AutoStart] Failed to auto-start tunnel: %v\n", err)
+		} else {
+			log.Println("[AutoStart] Tunnel auto-start triggered successfully!")
+		}
+	}()
+
 	server := &http.Server{
 		Addr:         addr,
 		Handler:      mux,

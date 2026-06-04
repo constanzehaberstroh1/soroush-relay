@@ -321,7 +321,7 @@ func runTunnelFlow(ctx context.Context, cancel context.CancelFunc) {
 		}()
 
 		// Wait for OFFER using text subscription
-		offerCtx, offerCancel := context.WithTimeout(ctx, 30*time.Second)
+		offerCtx, offerCancel := context.WithTimeout(ctx, 90*time.Second)
 		defer offerCancel()
 		textSub := router.SubscribeText()
 		defer router.UnsubscribeText(textSub)
@@ -1533,9 +1533,9 @@ func handleTunnelTest(w http.ResponseWriter, r *http.Request) {
 	}
 	addLog("[TunnelTest] DISCOVER sent to group, waiting for OFFER...", "info")
 
-	// Wait for OFFER response (timeout 30s)
+	// Wait for OFFER response (timeout 90s)
 	var offer *soroushlib.GroupCommand
-	offerCtx, offerCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	offerCtx, offerCancel := context.WithTimeout(context.Background(), 90*time.Second)
 
 	offerCh := make(chan *soroushlib.GroupCommand, 1)
 	go func() {
