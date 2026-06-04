@@ -12,22 +12,38 @@ import (
 // This allows stream-oriented protocols (like yamux) to multiplex over the
 // message-oriented DataChannel.
 type DataChannelConn struct {
-	dc     *webrtc.DataChannel
-	buf    chan []byte
-	rem    []byte
-	closed chan struct{}
-	once   sync.Once
+	dc          *webrtc.DataChannel
+	buf         chan []byte
+	rem         []byte
+	closed      chan struct{}
+	once        sync.Once
+	lastRxMutex sync.Mutex
+	lastRxTime  time.Time
 }
 
 // NewDataChannelConn creates a new DataChannelConn adapter.
 // It registers an OnMessage handler on the DataChannel to buffer incoming data.
 func NewDataChannelConn(dc *webrtc.DataChannel) *DataChannelConn {
 	c := &DataChannelConn{
-		dc:     dc,
-		buf:    make(chan []byte, 512),
-		closed: make(chan struct{}),
+		dc:         dc,
+		buf:        make(chan []byte, 512),
+		closed:     make(chan struct{}),
+		lastRxTime: time.Now(),
 	}
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		c.lastRxMutex.Lock()
+		c.lastRxTime = time.Now()
+		c.lastRxMutex.Unlock()
+
+		// Intercept stealth ping-pong frames to prevent polluting yamux buffer
+		if len(msg.Data) == 4 && string(msg.Data) == "PING" {
+			_ = dc.Send([]byte("PONG"))
+			return
+		}
+		if len(msg.Data) == 4 && string(msg.Data) == "PONG" {
+			return
+		}
+
 		data := make([]byte, len(msg.Data))
 		copy(data, msg.Data)
 		select {
@@ -38,6 +54,35 @@ func NewDataChannelConn(dc *webrtc.DataChannel) *DataChannelConn {
 	dc.OnClose(func() {
 		c.Close()
 	})
+
+	// Start DataChannel active keep-alive and dead-link detection loop
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				c.lastRxMutex.Lock()
+				lastRx := c.lastRxTime
+				c.lastRxMutex.Unlock()
+
+				// If no message or keepalive pong received for 45 seconds, assume dead
+				if time.Since(lastRx) > 45*time.Second {
+					c.Close()
+					return
+				}
+
+				// Proactively send a ping to keep NAT bindings open and verify path health
+				if err := dc.Send([]byte("PING")); err != nil {
+					c.Close()
+					return
+				}
+			case <-c.closed:
+				return
+			}
+		}
+	}()
+
 	return c
 }
 
