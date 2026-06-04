@@ -7,6 +7,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -456,9 +457,28 @@ func handleIncomingCall(ctx context.Context, session *soroushlib.MTProtoSession,
 		return fmt.Errorf("send phone.receivedCall: %w", err)
 	}
 
+	// Accept the call via Soroush signaling
+	gB := make([]byte, 256)
+	acceptBody := soroushlib.BuildPhoneAcceptCall(callEvent.CallID, callEvent.AccessHash, gB)
+	wrappedAccept := soroushlib.WrapInitConnection(soroushlib.SoroushAppID, acceptBody)
+
+	acceptCtx, acceptCancel := context.WithTimeout(ctx, 15*time.Second)
+	respCID, respReader, err := session.SendAndWait(acceptCtx, wrappedAccept, true)
+	acceptCancel()
+	if err != nil {
+		return fmt.Errorf("send phone.acceptCall: %w", err)
+	}
+
+	confirmedEvent, err := soroushlib.ParsePhoneCallResult(respCID, respReader)
+	if err != nil {
+		return fmt.Errorf("parse phone.acceptCall response: %w", err)
+	}
+
+	recordSystemLog(fmt.Sprintf("[Worker %s] Call accepted. Received %d dynamic connections.", account.PhoneNumber, len(confirmedEvent.Connections)), "info")
+
 	// Set up WebRTC PeerConnection (answerer)
 	var iceServers []webrtc.ICEServer
-	for _, conn := range callEvent.Connections {
+	for _, conn := range confirmedEvent.Connections {
 		if conn.Turn && conn.Username != "" {
 			turnTCP := fmt.Sprintf("turn:%s:%d?transport=tcp", conn.IP, conn.Port)
 			iceServers = append(iceServers, webrtc.ICEServer{
@@ -492,16 +512,41 @@ func handleIncomingCall(ctx context.Context, session *soroushlib.MTProtoSession,
 				ice.Username = srv.Username
 				ice.Credential = srv.Credential
 				ice.CredentialType = webrtc.ICECredentialTypePassword
+				iceServers = append(iceServers, ice)
+			} else {
+				hasTurnPrefix := false
+				for _, u := range srv.URLs {
+					if strings.HasPrefix(u, "turn:") {
+						hasTurnPrefix = true
+						break
+					}
+				}
+				if !hasTurnPrefix {
+					iceServers = append(iceServers, ice)
+				}
 			}
-			iceServers = append(iceServers, ice)
 		}
+	}
+
+	policy := webrtc.ICETransportPolicyRelay
+	hasTurn := false
+	for _, ice := range iceServers {
+		for _, url := range ice.URLs {
+			if strings.HasPrefix(url, "turn:") {
+				hasTurn = true
+				break
+			}
+		}
+	}
+	if !hasTurn {
+		policy = webrtc.ICETransportPolicyAll
 	}
 
 	config := webrtc.Configuration{
 		ICEServers:         iceServers,
 		BundlePolicy:       webrtc.BundlePolicyMaxBundle,
 		RTCPMuxPolicy:      webrtc.RTCPMuxPolicyRequire,
-		ICETransportPolicy: webrtc.ICETransportPolicyRelay, // Force TURN relay for bypass/censorship
+		ICETransportPolicy: policy,
 	}
 
 	pc, err := webrtc.NewPeerConnection(config)
@@ -582,15 +627,7 @@ func handleIncomingCall(ctx context.Context, session *soroushlib.MTProtoSession,
 		}
 	})
 
-	// Accept the call via Soroush signaling
-	gB := make([]byte, 256)
-	_, err = session.Send(ctx, soroushlib.BuildPhoneAcceptCall(callEvent.CallID, callEvent.AccessHash, gB), true)
-	if err != nil {
-		pc.Close()
-		return fmt.Errorf("send phone.acceptCall: %w", err)
-	}
-
-	recordSystemLog(fmt.Sprintf("[Worker %s] Call accepted. Waiting for SDP offer...", account.PhoneNumber), "info")
+	recordSystemLog(fmt.Sprintf("[Worker %s] Waiting for SDP offer...", account.PhoneNumber), "info")
 
 	// ── SDP Exchange: Listen for SDP_OFFER from client via Group Bus ──
 	sdpCtx, sdpCancel := context.WithTimeout(ctx, 45*time.Second)
