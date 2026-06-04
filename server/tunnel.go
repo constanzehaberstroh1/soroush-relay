@@ -383,6 +383,8 @@ func startWorkerListener(ctx context.Context, account *DBSoroushAccount, clientU
 	connCancel()
 	defer transport.Disconnect()
 
+	session.StartReader(ctx)
+
 	// Phase 4: Initialize connection and subscribe to updates by fetching dialogs (getDialogs) wrapped in initConnection.
 	initBody := soroushlib.BuildGetDialogsRequest()
 	wrappedInit := soroushlib.WrapInitConnection(soroushlib.SoroushAppID, initBody)
