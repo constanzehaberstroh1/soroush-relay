@@ -84,6 +84,8 @@ func initDB() {
 		log.Fatalf("[DB] Database migration failed: %v", err)
 	}
 	fmt.Println("[DB] Tables migrated successfully inside MySQL.")
+	// Modify columns to support utf8mb4 explicitly (fixes Error 1366 on Persian logs in MySQL)
+	db.Exec("ALTER TABLE db_log_entries MODIFY COLUMN message TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
 
 	// Seed Admin user
 	seedAdmin()
