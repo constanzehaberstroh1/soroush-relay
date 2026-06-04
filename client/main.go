@@ -173,6 +173,7 @@ func main() {
 	mux.HandleFunc("/api/groups/list", JWTMiddleware(handleFetchGroups))
 	mux.HandleFunc("/api/logs", JWTMiddleware(handleGetLogs))
 	mux.HandleFunc("/api/logs/clear", JWTMiddleware(handleClearLogs))
+	mux.HandleFunc("/api/server-logs", JWTMiddleware(handleGetServerLogs))
 
 	// CORS Preflight handler
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {

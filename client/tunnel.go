@@ -1465,3 +1465,39 @@ func handleTunnelTest(w http.ResponseWriter, r *http.Request) {
 		"overallLatencyMs": overallLatency,
 	})
 }
+
+// Proxies logs request from the client frontend to the exit node server using GORM database PSK
+func handleGetServerLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	serverURL := r.URL.Query().Get("serverUrl")
+	if serverURL == "" {
+		http.Error(w, `{"error":"serverUrl query parameter is required"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Fetch PSK from DB
+	var tunnelCfg DBTunnelConfig
+	if err := db.First(&tunnelCfg).Error; err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"Failed to retrieve tunnel configuration: %v"}`, err), http.StatusInternalServerError)
+		return
+	}
+
+	// Make request to server panel
+	logsURL := fmt.Sprintf("%s/api/logs/raw?psk=%s&format=json", serverURL, tunnelCfg.PSK)
+	
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Get(logsURL)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"Failed to fetch logs from server: %v"}`, err), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}

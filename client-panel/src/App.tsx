@@ -30,6 +30,8 @@ import {
   Step,
   StepLabel,
   Chip,
+  Tabs,
+  Tab,
 } from '@mui/material';
 import {
   Brightness4 as DarkModeIcon,
@@ -1387,9 +1389,15 @@ function SettingsView() {
 // ──────────────────────────────────────────────────────────────────────────────
 function LogsView() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [serverLogs, setServerLogs] = useState<LogEntry[]>([]);
+  const [activeTab, setActiveTab] = useState<'client' | 'server'>('client');
   const [filter, setFilter] = useState<string>('all');
   const [autoScroll, setAutoScroll] = useState(true);
   const logContainerRef = useRef<HTMLDivElement>(null);
+
+  const [serverUrl] = useState<string>(() => {
+    return localStorage.getItem('server-exit-url') || 'https://app-25d61cc9-bc8f-4d35-8fd8-c1a24ad4abb7.cleverapps.io';
+  });
 
   const fetchLogs = async () => {
     try {
@@ -1403,6 +1411,18 @@ function LogsView() {
     }
   };
 
+  const fetchServerLogs = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/server-logs?serverUrl=${encodeURIComponent(serverUrl)}`, { headers: getHeaders() });
+      if (res.ok) {
+        const data = await res.json();
+        setServerLogs(data);
+      }
+    } catch (err) {
+      console.error('Failed fetching server logs:', err);
+    }
+  };
+
   const handleClearLogs = async () => {
     if (!confirm('Clear all logs? This cannot be undone.')) return;
     try {
@@ -1411,26 +1431,41 @@ function LogsView() {
     } catch { /* ignore */ }
   };
 
+  const triggerRefresh = () => {
+    if (activeTab === 'client') {
+      fetchLogs();
+    } else {
+      fetchServerLogs();
+    }
+  };
+
   useEffect(() => {
-    fetchLogs();
-    const interval = setInterval(fetchLogs, 1500);
-    return () => clearInterval(interval);
-  }, []);
+    if (activeTab === 'client') {
+      fetchLogs();
+      const interval = setInterval(fetchLogs, 1500);
+      return () => clearInterval(interval);
+    } else {
+      fetchServerLogs();
+      const interval = setInterval(fetchServerLogs, 2000);
+      return () => clearInterval(interval);
+    }
+  }, [activeTab, serverUrl]);
 
   useEffect(() => {
     if (autoScroll && logContainerRef.current) {
       logContainerRef.current.scrollTop = 0;
     }
-  }, [logs, autoScroll]);
+  }, [logs, serverLogs, autoScroll, activeTab]);
 
-  const filteredLogs = filter === 'all' ? logs : logs.filter(l => l.type === filter);
+  const currentLogs = activeTab === 'client' ? logs : serverLogs;
+  const filteredLogs = filter === 'all' ? currentLogs : currentLogs.filter(l => l.type === filter);
 
   const logTypeCounts = {
-    all: logs.length,
-    info: logs.filter(l => l.type === 'info').length,
-    success: logs.filter(l => l.type === 'success').length,
-    warn: logs.filter(l => l.type === 'warn').length,
-    error: logs.filter(l => l.type === 'error').length,
+    all: currentLogs.length,
+    info: currentLogs.filter(l => l.type === 'info').length,
+    success: currentLogs.filter(l => l.type === 'success').length,
+    warn: currentLogs.filter(l => l.type === 'warn').length,
+    error: currentLogs.filter(l => l.type === 'error').length,
   };
 
   const typeColors: Record<string, string> = {
@@ -1451,14 +1486,42 @@ function LogsView() {
   return (
     <Card>
       <CardContent>
+        {/* Tab selection */}
+        <Box sx={{ borderBottom: 1, borderColor: 'rgba(255,255,255,0.08)', mb: 3 }}>
+          <Tabs
+            value={activeTab}
+            onChange={(_, val) => setActiveTab(val)}
+            textColor="primary"
+            indicatorColor="primary"
+            sx={{
+              '& .MuiTab-root': {
+                color: 'rgba(255,255,255,0.5)',
+                fontWeight: 600,
+                fontSize: '0.85rem',
+                textTransform: 'none',
+                pb: 1.5,
+              },
+              '& .Mui-selected': {
+                color: '#8b5cf6 !important',
+              },
+              '& .MuiTabs-indicator': {
+                backgroundColor: '#8b5cf6',
+              }
+            }}
+          >
+            <Tab label="Client Local Logs" value="client" />
+            <Tab label="Server Exit Logs" value="server" />
+          </Tabs>
+        </Box>
+
         {/* Header with controls */}
         <Box display="flex" alignItems="center" justifyContent="space-between" mb={2}>
           <Box display="flex" alignItems="center" gap={1.5}>
             <Typography variant="h6" fontWeight={700}>
-              Engine Logs
+              {activeTab === 'client' ? 'Client Engine Logs' : 'Server Exit Logs'}
             </Typography>
             <Chip
-              label={`${logs.length} entries`}
+              label={`${currentLogs.length} entries`}
               size="small"
               sx={{
                 bgcolor: 'rgba(139, 92, 246, 0.1)',
@@ -1467,6 +1530,21 @@ function LogsView() {
                 fontSize: '0.7rem',
               }}
             />
+            {activeTab === 'server' && (
+              <Chip
+                label="Exit Node"
+                size="small"
+                variant="outlined"
+                color="secondary"
+                sx={{
+                  height: 20,
+                  fontSize: '0.65rem',
+                  fontWeight: 700,
+                  borderColor: 'rgba(167, 139, 250, 0.3)',
+                  color: '#a78bfa',
+                }}
+              />
+            )}
           </Box>
           <Box display="flex" alignItems="center" gap={1}>
             <Chip
@@ -1482,17 +1560,19 @@ function LogsView() {
                 '&:hover': { bgcolor: autoScroll ? 'rgba(16, 185, 129, 0.2)' : 'rgba(255,255,255,0.1)' },
               }}
             />
-            <IconButton onClick={fetchLogs} color="primary" size="small">
+            <IconButton onClick={triggerRefresh} color="primary" size="small">
               <RefreshIcon fontSize="small" />
             </IconButton>
-            <Button
-              customVariant="danger"
-              size="small"
-              onClick={handleClearLogs}
-              style={{ padding: '3px 10px', fontSize: '0.7rem', minWidth: 0 }}
-            >
-              Clear
-            </Button>
+            {activeTab === 'client' && (
+              <Button
+                customVariant="danger"
+                size="small"
+                onClick={handleClearLogs}
+                style={{ padding: '3px 10px', fontSize: '0.7rem', minWidth: 0 }}
+              >
+                Clear
+              </Button>
+            )}
           </Box>
         </Box>
 
@@ -1534,6 +1614,7 @@ function LogsView() {
             flexDirection: 'column',
             gap: 0.25,
             boxShadow: 'inset 0 2px 10px rgba(0,0,0,0.8)',
+            border: activeTab === 'server' ? '1px solid rgba(139, 92, 246, 0.15)' : 'none',
             '&::-webkit-scrollbar': { width: '6px' },
             '&::-webkit-scrollbar-track': { bgcolor: 'transparent' },
             '&::-webkit-scrollbar-thumb': { bgcolor: 'rgba(255,255,255,0.1)', borderRadius: '3px' },
@@ -1582,7 +1663,7 @@ function LogsView() {
             <Box py={8} textAlign="center" color="text.secondary" display="flex" flexDirection="column" alignItems="center" gap={1}>
               <LogsIcon sx={{ fontSize: 40, opacity: 0.15 }} />
               <Typography variant="body2" color="text.secondary">
-                {filter !== 'all' ? `No ${filter} logs found.` : 'No logs recorded yet. Activity will appear here in real-time.'}
+                {filter !== 'all' ? `No ${filter} logs found.` : 'No logs recorded yet. Activity will appear here.'}
               </Typography>
             </Box>
           )}

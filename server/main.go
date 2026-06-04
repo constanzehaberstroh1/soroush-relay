@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -198,6 +199,7 @@ func main() {
 	mux.HandleFunc("/api/groups/list", JWTMiddleware(handleFetchGroups))
 	mux.HandleFunc("/api/logs", JWTMiddleware(handleGetLogs))
 	mux.HandleFunc("/api/logs/clear", JWTMiddleware(handleClearLogs))
+	mux.HandleFunc("/api/logs/raw", handleGetServerRawLogs)
 
 	// CORS Preflight handler
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
@@ -372,4 +374,84 @@ func handleClearLogs(w http.ResponseWriter, r *http.Request) {
 	addLog("Logs cleared by admin.", "info")
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"message":"Logs cleared"}`))
+}
+
+func handleGetServerRawLogs(w http.ResponseWriter, r *http.Request) {
+	// Enable CORS for client panel requests
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Tunnel-PSK")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	authorized := false
+
+	// Check PSK in query parameter or header
+	reqPSK := r.URL.Query().Get("psk")
+	if reqPSK == "" {
+		reqPSK = r.Header.Get("X-Tunnel-PSK")
+	}
+
+	if reqPSK != "" {
+		var groupCfg DBGroupConfig
+		if err := db.First(&groupCfg).Error; err == nil {
+			if groupCfg.PSK != "" && reqPSK == groupCfg.PSK {
+				authorized = true
+			}
+		}
+	}
+
+	// Fallback to JWT authentication if PSK is not provided or invalid
+	if !authorized {
+		authHeader := r.Header.Get("Authorization")
+		if authHeader != "" && strings.HasPrefix(authHeader, "Bearer ") {
+			tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+			_, err := ValidateToken(tokenStr)
+			if err == nil {
+				authorized = true
+			}
+		}
+	}
+
+	if !authorized {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"Unauthorized"}`))
+		return
+	}
+
+	// Fetch last 1000 logs from database
+	var dbLogs []DBLogEntry
+	if err := db.Order("id desc").Limit(1000).Find(&dbLogs).Error; err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	// Reverse to chronological order (oldest to newest)
+	for i, j := 0, len(dbLogs)-1; i < j; i, j = i+1, j-1 {
+		dbLogs[i], dbLogs[j] = dbLogs[j], dbLogs[i]
+	}
+
+	// Format representation
+	format := r.URL.Query().Get("format")
+	if format == "json" || strings.Contains(r.Header.Get("Accept"), "application/json") {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(dbLogs)
+		return
+	}
+
+	// Plain text standard log format: [YYYY-MM-DD HH:MM:SS] [TYPE] Message
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	for _, entry := range dbLogs {
+		fmt.Fprintf(w, "[%s] [%s] %s\n", entry.Timestamp, strings.ToUpper(entry.Type), entry.Message)
+	}
 }
