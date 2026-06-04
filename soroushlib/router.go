@@ -2,6 +2,7 @@ package soroushlib
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"sync"
 )
@@ -14,19 +15,22 @@ type UpdateMessage struct {
 
 // MessageRouter coordinates reading from one MTProto session and broadcasting to subscribers
 type MessageRouter struct {
-	session    *MTProtoSession
-	mu         sync.Mutex
-	subsUpdate []chan UpdateMessage
-	subsText   []chan IncomingMessage
-	running    bool
-	done       chan struct{}
+	session          *MTProtoSession
+	mu               sync.Mutex
+	subsUpdate       []chan UpdateMessage
+	subsText         []chan IncomingMessage
+	running          bool
+	done             chan struct{}
+	userAccessHashes map[int64]int64
+	accessHashMu     sync.Mutex
 }
 
 // NewMessageRouter creates a new MessageRouter
 func NewMessageRouter(session *MTProtoSession) *MessageRouter {
 	return &MessageRouter{
-		session: session,
-		done:    make(chan struct{}),
+		session:          session,
+		done:             make(chan struct{}),
+		userAccessHashes: make(map[int64]int64),
 	}
 }
 
@@ -123,6 +127,9 @@ func (mr *MessageRouter) Run(ctx context.Context) error {
 
 			cid := msg.CID
 			rawBytes := msg.Data
+			if rawBytes != nil {
+				mr.ScanAndCacheAccessHashes(rawBytes)
+			}
 			var reader *TLReader
 			if rawBytes != nil {
 				reader = NewTLReader(rawBytes)
@@ -150,6 +157,32 @@ func (mr *MessageRouter) Run(ctx context.Context) error {
 					}
 					mr.mu.Unlock()
 				})
+			}
+		}
+	}
+}
+
+// GetUserAccessHash returns the cached access hash of a Soroush user ID
+func (mr *MessageRouter) GetUserAccessHash(userID int64) int64 {
+	mr.accessHashMu.Lock()
+	defer mr.accessHashMu.Unlock()
+	return mr.userAccessHashes[userID]
+}
+
+// ScanAndCacheAccessHashes scans raw bytes for user constructor signatures and caches access hashes
+func (mr *MessageRouter) ScanAndCacheAccessHashes(raw []byte) {
+	userCID := uint32(0x6A2179DD)
+	mr.accessHashMu.Lock()
+	defer mr.accessHashMu.Unlock()
+
+	for i := 0; i+32 <= len(raw); i++ {
+		cid := binary.LittleEndian.Uint32(raw[i : i+4])
+		if cid == userCID {
+			flags := binary.LittleEndian.Uint32(raw[i+4 : i+8])
+			if flags&(1<<0) != 0 {
+				accessHash := int64(binary.LittleEndian.Uint64(raw[i+16 : i+24]))
+				id := int64(binary.LittleEndian.Uint64(raw[i+24 : i+32]))
+				mr.userAccessHashes[id] = accessHash
 			}
 		}
 	}

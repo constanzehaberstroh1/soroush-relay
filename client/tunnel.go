@@ -182,8 +182,67 @@ func runTunnelFlow(ctx context.Context, cancel context.CancelFunc) {
 	session.StartReader(ctx)
 	recordSystemLog("[Tunnel] MTProto transport connected to wss://im-server.splus.ir/apiws", "success")
 
+	// Warm up connection and subscribe to updates by calling initConnection + getDialogs
+	initBody := soroushlib.BuildGetDialogsRequest()
+	wrappedInit := soroushlib.WrapInitConnection(soroushlib.SoroushAppID, initBody)
+	initCtx, initCancel := context.WithTimeout(ctx, 30*time.Second)
+	cid, r, err := session.SendAndWait(initCtx, wrappedInit, true)
+	initCancel()
+	if err != nil {
+		recordSystemLog(fmt.Sprintf("[Tunnel] Connection initialization (getDialogs) failed: %v", err), "warn")
+	} else {
+		recordSystemLog("[Tunnel] Connection initialized and dialog list loaded ✅", "success")
+		if r != nil {
+			innerCID, innerReader := unwrapResponse(cid, r, 0)
+			innerBytes := innerReader.GetData()
+			dialogs, parseErr := soroushlib.ParseDialogsForGroups(innerCID, soroushlib.NewTLReader(innerBytes))
+			if parseErr == nil {
+				for _, d := range dialogs {
+					if d.ID == config.GroupChatID {
+						if d.AccessHash != config.GroupAccessHash {
+							recordSystemLog(fmt.Sprintf("[Tunnel] Group access hash updated from dialogs list: old=%d, new=%d", config.GroupAccessHash, d.AccessHash), "info")
+							config.GroupAccessHash = d.AccessHash
+						}
+					}
+				}
+			} else {
+				recordSystemLog(fmt.Sprintf("[Tunnel] Failed to parse dialogs list: %v", parseErr), "warn")
+			}
+		}
+	}
+
 	// Start MessageRouter
 	router := soroushlib.NewMessageRouter(session)
+	if err == nil && r != nil {
+		_, innerReader := unwrapResponse(cid, r, 0)
+		router.ScanAndCacheAccessHashes(innerReader.GetData())
+	}
+
+	// Fetch group chat details to populate user access hashes (so we get worker's correct access hash)
+	if config.GroupChatID != 0 {
+		recordSystemLog("[Tunnel] Querying group chat metadata for member access hashes...", "info")
+		partBody := soroushlib.BuildGetFullGroupRequest(config.GroupChatID, config.GroupAccessHash)
+		partCtx, partCancel := context.WithTimeout(ctx, 15*time.Second)
+		partCID, partResp, partErr := session.SendAndWait(partCtx, partBody, true)
+		partCancel()
+
+		// Fallback to getFullChat if getFullChannel failed or if group access hash was used
+		if partErr != nil && config.GroupAccessHash != 0 {
+			recordSystemLog("[Tunnel] getFullChannel failed, falling back to messages.getFullChat...", "info")
+			fallbackBody := soroushlib.BuildGetFullGroupRequest(config.GroupChatID, 0)
+			partCtx2, partCancel2 := context.WithTimeout(ctx, 15*time.Second)
+			partCID, partResp, partErr = session.SendAndWait(partCtx2, fallbackBody, true)
+			partCancel2()
+		}
+
+		if partErr != nil {
+			recordSystemLog(fmt.Sprintf("[Tunnel] Failed to fetch group metadata: %v", partErr), "warn")
+		} else if partResp != nil {
+			router.ScanAndCacheAccessHashes(partResp.GetData())
+			recordSystemLog(fmt.Sprintf("[Tunnel] Group metadata loaded (CID=0x%08X) and access hashes cached ✅", partCID), "success")
+		}
+	}
+
 	go func() {
 		if err := router.Run(ctx); err != nil {
 			if ctx.Err() == nil {
@@ -408,6 +467,15 @@ func establishWebRTC(ctx context.Context, session *soroushlib.MTProtoSession, ro
 	workerUID := tunnel.workerUserID
 	workerAH := tunnel.workerAccessHash
 	tunnel.mu.Unlock()
+
+	// Try to resolve worker's correct access hash from the router's cache
+	cachedAH := router.GetUserAccessHash(workerUID)
+	if cachedAH != 0 {
+		workerAH = cachedAH
+		recordSystemLog(fmt.Sprintf("[Tunnel] Resolved correct access hash for worker UID %d from cache: %d", workerUID, workerAH), "info")
+	} else {
+		recordSystemLog(fmt.Sprintf("[Tunnel] Warning: Worker access hash not found in cache. Using fallback/configured access hash: %d", workerAH), "warn")
+	}
 
 	// ── Step 7: Complete Soroush Call Setup ──
 	a, gA, gAHash := generateClientDH()

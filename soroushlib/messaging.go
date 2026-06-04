@@ -864,3 +864,20 @@ func RestoreSession(authKey []byte, authKeyID []byte, serverSalt []byte) (*MTPro
 
 	return session, transport
 }
+
+// BuildGetFullGroupRequest builds getFullChannel or getFullChat depending on accessHash
+func BuildGetFullGroupRequest(chatID int64, accessHash int64) []byte {
+	if accessHash != 0 {
+		w := NewTLWriter()
+		w.WriteUint32(0x08736A09) // channels.getFullChannel
+		w.WriteUint32(0xAFB8849B) // inputChannel
+		w.WriteInt64(chatID)
+		w.WriteInt64(accessHash)
+		return w.GetBytes()
+	} else {
+		w := NewTLWriter()
+		w.WriteUint32(0xAEB00B34) // messages.getFullChat
+		w.WriteInt64(chatID)
+		return w.GetBytes()
+	}
+}

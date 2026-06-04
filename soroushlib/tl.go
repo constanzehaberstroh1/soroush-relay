@@ -100,6 +100,10 @@ func NewTLReader(data []byte) *TLReader {
 	return &TLReader{data: data, pos: 0}
 }
 
+func (r *TLReader) GetData() []byte {
+	return r.data
+}
+
 func (r *TLReader) ReadInt32() (int32, error) {
 	if r.pos+4 > len(r.data) {
 		return 0, fmt.Errorf("ReadInt32: not enough data at pos=%d, len=%d", r.pos, len(r.data))
