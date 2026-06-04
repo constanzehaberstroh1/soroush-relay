@@ -46,7 +46,20 @@ type OTPVerifyRequest struct {
 }
 
 func recordSystemLog(message string, logType string) {
-	addLog(message, logType)
+	// Skip writing low-level MTProto details to local SQLite log database to avoid DB spam
+	lowerMsg := strings.ToLower(message)
+	isLowLevel := strings.Contains(lowerMsg, "parseupdates") || 
+		strings.Contains(lowerMsg, "processing update") || 
+		strings.Contains(lowerMsg, "parseupdatenewmessage") || 
+		strings.Contains(lowerMsg, "reader:") || 
+		strings.Contains(lowerMsg, "pingdelaydisconnect") || 
+		strings.Contains(lowerMsg, "sendwait") ||
+		strings.Contains(lowerMsg, "[mtproto]") ||
+		strings.Contains(lowerMsg, "[messaging]")
+	
+	if !isLowLevel {
+		addLog(message, logType)
+	}
 	fmt.Printf("[%s] %s\n", strings.ToUpper(logType), message)
 }
 
