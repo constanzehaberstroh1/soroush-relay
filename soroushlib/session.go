@@ -44,6 +44,8 @@ type MTProtoSession struct {
 	readerErr    error
 	readerWG     sync.WaitGroup
 	readerOnce   sync.Once
+
+	Logger func(msg string, level string)
 }
 
 func NewSession(transport *ObfuscatedTransport) *MTProtoSession {
@@ -719,4 +721,12 @@ func bigIntToBytes(n int64) []byte {
 	bn := big.NewInt(n)
 	b := bn.Bytes()
 	return b
+}
+
+func (s *MTProtoSession) Log(msg string, level string) {
+	if s != nil && s.Logger != nil {
+		s.Logger(msg, level)
+	} else {
+		log.Printf("[%s] %s", strings.ToUpper(level), msg)
+	}
 }
