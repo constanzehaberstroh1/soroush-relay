@@ -156,6 +156,16 @@ func main() {
 	startLogWriter()
 	addLog("Soroush exit node engine started.", "info")
 
+	// Automatically start the server tunnel if a group configuration is present
+	go func() {
+		time.Sleep(2 * time.Second)
+		if err := startServerTunnel(); err != nil {
+			addLog(fmt.Sprintf("Auto-starting server tunnel failed: %v", err), "warn")
+		} else {
+			addLog("Auto-started server tunnel successfully ✅", "success")
+		}
+	}()
+
 	// Get embedded assets filesystem
 	var distFS fs.FS
 	if _, err := embedFS.ReadDir("dist"); err == nil {
