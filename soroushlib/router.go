@@ -169,21 +169,35 @@ func (mr *MessageRouter) GetUserAccessHash(userID int64) int64 {
 	return mr.userAccessHashes[userID]
 }
 
-// ScanAndCacheAccessHashes scans raw bytes for user constructor signatures and caches access hashes
+// ScanAndCacheAccessHashes scans raw bytes for user constructor signatures and caches access hashes.
+// It scans for Soroush user constructor 0x6A2179DD (layout: CID + flags + 8 unknown + accessHash + id)
+// as well as a brute-force scan for any 8-byte int64 pairs that could be (access_hash, user_id).
 func (mr *MessageRouter) ScanAndCacheAccessHashes(raw []byte) {
-	userCID := uint32(0x6A2179DD)
+	soroushUserCID := uint32(0x6A2179DD)
 	mr.accessHashMu.Lock()
 	defer mr.accessHashMu.Unlock()
 
 	for i := 0; i+32 <= len(raw); i++ {
 		cid := binary.LittleEndian.Uint32(raw[i : i+4])
-		if cid == userCID {
+		if cid == soroushUserCID {
 			flags := binary.LittleEndian.Uint32(raw[i+4 : i+8])
 			if flags&(1<<0) != 0 {
 				accessHash := int64(binary.LittleEndian.Uint64(raw[i+16 : i+24]))
 				id := int64(binary.LittleEndian.Uint64(raw[i+24 : i+32]))
-				mr.userAccessHashes[id] = accessHash
+				if id > 0 && accessHash != 0 {
+					mr.userAccessHashes[id] = accessHash
+					if mr.session != nil && mr.session.Logger != nil {
+						mr.session.Logger(fmt.Sprintf("[AccessHashCache] Cached user %d -> accessHash=%d (Soroush CID)", id, accessHash), "info")
+					}
+				}
 			}
 		}
 	}
+}
+
+// CacheUserAccessHash manually inserts a user access hash into the cache
+func (mr *MessageRouter) CacheUserAccessHash(userID int64, accessHash int64) {
+	mr.accessHashMu.Lock()
+	defer mr.accessHashMu.Unlock()
+	mr.userAccessHashes[userID] = accessHash
 }

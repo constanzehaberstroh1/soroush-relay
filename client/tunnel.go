@@ -474,7 +474,30 @@ func establishWebRTC(ctx context.Context, session *soroushlib.MTProtoSession, ro
 		workerAH = cachedAH
 		recordSystemLog(fmt.Sprintf("[Tunnel] Resolved correct access hash for worker UID %d from cache: %d", workerUID, workerAH), "info")
 	} else {
-		recordSystemLog(fmt.Sprintf("[Tunnel] Warning: Worker access hash not found in cache. Using fallback/configured access hash: %d", workerAH), "warn")
+		// Access hash not in cache yet — try fetching group history to trigger user object delivery
+		recordSystemLog("[Tunnel] Worker access hash not in cache. Fetching group message history to populate user cache...", "info")
+		histBody := soroushlib.BuildGetHistoryRequest(groupChatID, config.GroupAccessHash, 0, 0, 0, 10)
+		histCtx, histCancel := context.WithTimeout(ctx, 10*time.Second)
+		_, histResp, histErr := session.SendAndWait(histCtx, histBody, true)
+		histCancel()
+		if histErr == nil && histResp != nil {
+			router.ScanAndCacheAccessHashes(histResp.GetData())
+			cachedAH = router.GetUserAccessHash(workerUID)
+			if cachedAH != 0 {
+				workerAH = cachedAH
+				recordSystemLog(fmt.Sprintf("[Tunnel] Resolved worker access hash from group history: UID %d -> %d", workerUID, workerAH), "success")
+			}
+		}
+
+		if cachedAH == 0 {
+			// Still not found — manually cache the OFFER-provided access hash as last resort
+			if workerAH != 0 && workerAH != 1 {
+				router.CacheUserAccessHash(workerUID, workerAH)
+				recordSystemLog(fmt.Sprintf("[Tunnel] Using OFFER-provided access hash for worker UID %d: %d", workerUID, workerAH), "warn")
+			} else {
+				recordSystemLog(fmt.Sprintf("[Tunnel] WARNING: Worker access hash unavailable (UID %d, fallback=%d). Call may fail.", workerUID, workerAH), "error")
+			}
+		}
 	}
 
 	// ── Step 7: Complete Soroush Call Setup ──

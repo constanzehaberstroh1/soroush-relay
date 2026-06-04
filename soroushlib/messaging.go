@@ -24,6 +24,9 @@ const (
 	// InputPeerUser — 0xDDE8A54C (Soroush layer 182)
 	IDInputPeerUser uint32 = 0xDDE8A54C
 
+	// InputUser — 0xF21158C6 (used by phone.requestCall, users.getUsers, etc.)
+	IDInputUser uint32 = 0xF21158C6
+
 	// InputPeerChat — 0x35A95CB9 (for group chats)
 	IDInputPeerChat uint32 = 0x35A95CB9
 
@@ -880,4 +883,32 @@ func BuildGetFullGroupRequest(chatID int64, accessHash int64) []byte {
 		w.WriteInt64(chatID)
 		return w.GetBytes()
 	}
+}
+
+// BuildGetHistoryRequest builds a messages.getHistory TL request.
+// This fetches recent messages from a chat/channel, and the response includes
+// user objects for all senders — perfect for caching access hashes.
+func BuildGetHistoryRequest(chatID int64, accessHash int64, offsetID int32, offsetDate int32, addOffset int32, limit int32) []byte {
+	w := NewTLWriter()
+	w.WriteUint32(0xAFA92846) // messages.getHistory
+
+	// peer
+	if accessHash != 0 {
+		w.WriteUint32(IDInputPeerChannel)
+		w.WriteInt64(chatID)
+		w.WriteInt64(accessHash)
+	} else {
+		w.WriteUint32(IDInputPeerChat)
+		w.WriteInt64(chatID)
+	}
+
+	w.WriteInt32(offsetID)   // offset_id
+	w.WriteInt32(offsetDate) // offset_date
+	w.WriteInt32(addOffset)  // add_offset
+	w.WriteInt32(limit)      // limit
+	w.WriteInt32(0)          // max_id
+	w.WriteInt32(0)          // min_id
+	w.WriteInt64(0)          // hash
+
+	return w.GetBytes()
 }

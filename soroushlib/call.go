@@ -150,8 +150,8 @@ func BuildPhoneRequestCall(userID int64, accessHash int64, randomID int32, gAHas
 	// flags = 0x01 (bit 0 = video, we set it to look like a video call for maximum bandwidth)
 	w.WriteInt32(0x01)
 
-	// user_id = InputPeerUser
-	w.WriteUint32(IDInputPeerUser)
+	// user_id = InputUser (NOT InputPeerUser — phone.requestCall takes InputUser)
+	w.WriteUint32(IDInputUser)
 	w.WriteInt64(userID)
 	w.WriteInt64(accessHash)
 
