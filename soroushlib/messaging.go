@@ -563,7 +563,7 @@ func processUpdate(cid uint32, r *TLReader, session *MTProtoSession, handler fun
 
 	case IDUpdates:
 		// Full updates container
-		parseUpdates(r, handler)
+		parseUpdates(r, session, handler)
 		return
 
 	case IDUpdateShort:
@@ -647,12 +647,14 @@ func parseUpdateNewMessage(r *TLReader, handler func(msg IncomingMessage)) {
 }
 
 // parseUpdates parses a full updates object
-func parseUpdates(r *TLReader, handler func(msg IncomingMessage)) {
+func parseUpdates(r *TLReader, session *MTProtoSession, handler func(msg IncomingMessage)) {
 	// updates vector
 	r.ReadUint32() // vector constructor
 	count, _ := r.ReadInt32()
+	session.Log(fmt.Sprintf("[Messaging] parseUpdates: Processing %d updates in vector", count), "info")
 	for i := int32(0); i < count; i++ {
 		updateCID, _ := r.ReadUint32()
+		session.Log(fmt.Sprintf("[Messaging] parseUpdates: item %d/%d updateCID=0x%08X", i+1, count, updateCID), "info")
 		if updateCID == IDUpdateNewMessage || updateCID == IDUpdateNewChannelMessage {
 			parseUpdateNewMessage(r, handler)
 		}
