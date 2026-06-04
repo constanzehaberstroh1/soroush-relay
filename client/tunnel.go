@@ -326,13 +326,23 @@ func runTunnelFlow(ctx context.Context, cancel context.CancelFunc) {
 		textSub := router.SubscribeText()
 		defer router.UnsubscribeText(textSub)
 
+		warmupEnd := time.Now().Add(3 * time.Second)
+		var maxMsgID int32
+
 		go func() {
 			for msg := range textSub {
-				// Ignore historical messages older than 30 seconds
-				if msg.Date != 0 && time.Now().Unix()-int64(msg.Date) > 30 {
+				if time.Now().Before(warmupEnd) {
+					if msg.MessageID > maxMsgID {
+						maxMsgID = msg.MessageID
+					}
 					continue
 				}
-				recordSystemLog(fmt.Sprintf("[Tunnel] Subscription received msg: ChatID=%d FromUID=%d Text=%s Date=%d", msg.ChatID, msg.FromUserID, msg.Text, msg.Date), "info")
+				if msg.MessageID <= maxMsgID {
+					continue
+				}
+				maxMsgID = msg.MessageID
+
+				recordSystemLog(fmt.Sprintf("[Tunnel] Subscription received msg: ChatID=%d FromUID=%d Text=%s Date=%d ID=%d", msg.ChatID, msg.FromUserID, msg.Text, msg.Date, msg.MessageID), "info")
 				if !msg.IsGroup || msg.ChatID != config.GroupChatID || msg.FromUserID == clientAcc.SoroushUserID {
 					continue
 				}

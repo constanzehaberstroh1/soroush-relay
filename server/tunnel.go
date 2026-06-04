@@ -244,6 +244,9 @@ func runGroupObserverOnce(ctx context.Context) error {
 	textSub := router.SubscribeText()
 	defer router.UnsubscribeText(textSub)
 
+	warmupEnd := time.Now().Add(3 * time.Second)
+	var maxMsgID int32
+
 	go func() {
 		for {
 			select {
@@ -253,11 +256,18 @@ func runGroupObserverOnce(ctx context.Context) error {
 				if !ok {
 					return
 				}
-				// Ignore historical messages older than 30 seconds
-				if msg.Date != 0 && time.Now().Unix()-int64(msg.Date) > 30 {
+				if time.Now().Before(warmupEnd) {
+					if msg.MessageID > maxMsgID {
+						maxMsgID = msg.MessageID
+					}
 					continue
 				}
-				recordSystemLog(fmt.Sprintf("[GroupObserver] Received message: ChatID=%d, FromUID=%d, IsGroup=%t, TextLen=%d, Date=%d", msg.ChatID, msg.FromUserID, msg.IsGroup, len(msg.Text), msg.Date), "info")
+				if msg.MessageID <= maxMsgID {
+					continue
+				}
+				maxMsgID = msg.MessageID
+
+				recordSystemLog(fmt.Sprintf("[GroupObserver] Received message: ChatID=%d, FromUID=%d, IsGroup=%t, TextLen=%d, Date=%d, ID=%d", msg.ChatID, msg.FromUserID, msg.IsGroup, len(msg.Text), msg.Date, msg.MessageID), "info")
 				if !msg.IsGroup || msg.ChatID != chatID {
 					continue
 				}
