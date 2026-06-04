@@ -170,24 +170,28 @@ func (mr *MessageRouter) GetUserAccessHash(userID int64) int64 {
 }
 
 // ScanAndCacheAccessHashes scans raw bytes for user constructor signatures and caches access hashes.
-// It scans for Soroush user constructor 0x6A2179DD (layout: CID + flags + 8 unknown + accessHash + id)
-// as well as a brute-force scan for any 8-byte int64 pairs that could be (access_hash, user_id).
+// It scans for Soroush user constructors 0x274DB727 and 0x6A2179DD (layout: CID + flags + flags2 + id + accessHash)
 func (mr *MessageRouter) ScanAndCacheAccessHashes(raw []byte) {
-	soroushUserCID := uint32(0x6A2179DD)
 	mr.accessHashMu.Lock()
 	defer mr.accessHashMu.Unlock()
 
-	for i := 0; i+32 <= len(raw); i++ {
-		cid := binary.LittleEndian.Uint32(raw[i : i+4])
-		if cid == soroushUserCID {
-			flags := binary.LittleEndian.Uint32(raw[i+4 : i+8])
-			if flags&(1<<0) != 0 {
-				accessHash := int64(binary.LittleEndian.Uint64(raw[i+16 : i+24]))
-				id := int64(binary.LittleEndian.Uint64(raw[i+24 : i+32]))
-				if id > 0 && accessHash != 0 {
-					mr.userAccessHashes[id] = accessHash
-					if mr.session != nil && mr.session.Logger != nil {
-						mr.session.Logger(fmt.Sprintf("[AccessHashCache] Cached user %d -> accessHash=%d (Soroush CID)", id, accessHash), "info")
+	targetCIDs := []uint32{0x274DB727, 0x6A2179DD}
+	for _, targetCID := range targetCIDs {
+		for i := 0; i+28 <= len(raw); i++ {
+			cid := binary.LittleEndian.Uint32(raw[i : i+4])
+			if cid == targetCID {
+				flags := binary.LittleEndian.Uint32(raw[i+4 : i+8])
+				// layout: CID (4) + flags (4) + flags2 (4) + id (8) + access_hash (8, if flags bit 0 is set)
+				if flags&(1<<0) != 0 {
+					if i+28 <= len(raw) {
+						id := int64(binary.LittleEndian.Uint64(raw[i+12 : i+20]))
+						accessHash := int64(binary.LittleEndian.Uint64(raw[i+20 : i+28]))
+						if id > 0 && accessHash != 0 {
+							mr.userAccessHashes[id] = accessHash
+							if mr.session != nil && mr.session.Logger != nil {
+								mr.session.Logger(fmt.Sprintf("[AccessHashCache] Cached user %d -> accessHash=%d (CID 0x%08X)", id, accessHash, cid), "info")
+							}
+						}
 					}
 				}
 			}
