@@ -352,6 +352,11 @@ func (s *MTProtoSession) SendAndWait(ctx context.Context, body []byte, contentRe
 				}
 				return 0, nil, resp.err
 			}
+			if resp.cid == IDRPCError {
+				errorCode, _ := resp.reader.ReadInt32()
+				errorMessage, _ := resp.reader.ReadString()
+				return resp.cid, resp.reader, fmt.Errorf("RPC error %d: %s", errorCode, errorMessage)
+			}
 			return resp.cid, resp.reader, nil
 		}
 	}
