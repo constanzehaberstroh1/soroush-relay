@@ -189,6 +189,21 @@ func runTunnelFlow(ctx context.Context, cancel context.CancelFunc) {
 		}
 	}()
 
+	// Start keepalive ping ticker for client Soroush WebSocket
+	go func() {
+		ticker := time.NewTicker(20 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				pingBody := soroushlib.BuildPingDelayDisconnectRequest(time.Now().UnixNano(), 75)
+				session.Send(ctx, pingBody, true)
+			}
+		}
+	}()
+
 	tunnel.mu.Lock()
 	tunnel.clientSession = session
 	tunnel.clientTransport = transport
@@ -214,14 +229,33 @@ func runTunnelFlow(ctx context.Context, cancel context.CancelFunc) {
 		}
 		discBody := soroushlib.BuildSendChannelMessage(config.GroupChatID, config.GroupAccessHash, encoded, time.Now().UnixNano())
 		wrappedDisc := soroushlib.WrapInitConnection(soroushlib.SoroushAppID, discBody)
-		discCtx, discCancel := context.WithTimeout(ctx, 30*time.Second)
-		_, _, err = session.SendAndWait(discCtx, wrappedDisc, true)
-		discCancel()
-		if err != nil {
-			setTunnelError(fmt.Sprintf("DISCOVER failed: %v", err))
-			return
-		}
-		recordSystemLog("[Tunnel] DISCOVER sent ✅", "success")
+
+		offerDone := make(chan bool)
+		var offer *soroushlib.GroupCommand
+
+		// Start a background sender that retries DISCOVER every 5 seconds until OFFER is received
+		discoverCtx, discoverCancel := context.WithCancel(ctx)
+		defer discoverCancel()
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for {
+				discCtx, discCancel := context.WithTimeout(discoverCtx, 10*time.Second)
+				_, _, err := session.SendAndWait(discCtx, wrappedDisc, true)
+				discCancel()
+				if err != nil {
+					recordSystemLog(fmt.Sprintf("[Tunnel] Retrying DISCOVER failed: %v", err), "warn")
+				} else {
+					recordSystemLog("[Tunnel] DISCOVER sent ✅", "success")
+				}
+
+				select {
+				case <-discoverCtx.Done():
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
 
 		// Wait for OFFER using text subscription
 		offerCtx, offerCancel := context.WithTimeout(ctx, 30*time.Second)
@@ -229,8 +263,6 @@ func runTunnelFlow(ctx context.Context, cancel context.CancelFunc) {
 		textSub := router.SubscribeText()
 		defer router.UnsubscribeText(textSub)
 
-		var offer *soroushlib.GroupCommand
-		offerDone := make(chan bool)
 		go func() {
 			for msg := range textSub {
 				if !msg.IsGroup || msg.ChatID != config.GroupChatID || msg.FromUserID == clientAcc.SoroushUserID {
@@ -242,6 +274,7 @@ func runTunnelFlow(ctx context.Context, cancel context.CancelFunc) {
 				}
 				if cmd.Cmd == soroushlib.CmdOffer && cmd.CID == clientID {
 					offer = cmd
+					discoverCancel() // Stop broadcasting DISCOVER
 					select {
 					case offerDone <- true:
 					default:

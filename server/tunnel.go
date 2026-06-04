@@ -209,8 +209,8 @@ func runGroupObserverOnce(ctx context.Context) error {
 	heartbeatTicker := time.NewTicker(5 * time.Minute)
 	defer heartbeatTicker.Stop()
 
-	// Ping ticker to keep the Soroush WebSocket alive
-	pingTicker := time.NewTicker(60 * time.Second)
+	// Ping ticker to keep the Soroush WebSocket alive (20s interval to prevent idle close)
+	pingTicker := time.NewTicker(20 * time.Second)
 	defer pingTicker.Stop()
 
 	errCh := make(chan error, 1)
@@ -232,7 +232,8 @@ func runGroupObserverOnce(ctx context.Context) error {
 
 			switch cmd.Cmd {
 			case soroushlib.CmdDiscover:
-				if _, ok := repliedDiscovers[cmd.CID]; ok {
+				lastReplied, ok := repliedDiscovers[cmd.CID]
+				if ok && time.Since(lastReplied) < 3*time.Second {
 					return
 				}
 				repliedDiscovers[cmd.CID] = time.Now()
