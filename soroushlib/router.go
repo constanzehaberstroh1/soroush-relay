@@ -3,7 +3,6 @@ package soroushlib
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 )
 
@@ -90,7 +89,6 @@ func (mr *MessageRouter) Run(ctx context.Context) error {
 		mr.running = false
 		// Close all subscribers
 		for _, ch := range mr.subsUpdate {
-			// Drain and close
 			select {
 			case <-ch:
 			default:
@@ -109,60 +107,50 @@ func (mr *MessageRouter) Run(ctx context.Context) error {
 		mr.mu.Unlock()
 	}()
 
+	mr.session.StartReader(ctx)
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
-		}
-
-		cid, reader, err := mr.session.Recv(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			errStr := err.Error()
-			if strings.Contains(errStr, "closed network connection") ||
-				strings.Contains(errStr, "broken pipe") ||
-				strings.Contains(errStr, "connection reset") ||
-				strings.Contains(errStr, "EOF") {
-				return fmt.Errorf("connection lost: %w", err)
-			}
-			return fmt.Errorf("recv error: %w", err)
-		}
-
-		// Save the raw reader bytes before reading from it
-		var rawBytes []byte
-		if reader != nil {
-			rem := reader.Remaining()
-			rawBytes, _ = reader.ReadRaw(rem)
-			// Recreate the reader for our own processing
-			reader = NewTLReader(rawBytes)
-		}
-
-		// Dispatch raw update
-		mr.mu.Lock()
-		for _, ch := range mr.subsUpdate {
-			select {
-			case ch <- UpdateMessage{CID: cid, Data: rawBytes}:
-			default:
-				// Avoid blocking on slow channel
-			}
-		}
-		mr.mu.Unlock()
-
-		// Also check if we can process it as text message updates
-		if reader != nil {
-			processUpdate(cid, reader, mr.session, func(msg IncomingMessage) {
-				mr.mu.Lock()
-				for _, ch := range mr.subsText {
-					select {
-					case ch <- msg:
-					default:
-					}
+		case msg, ok := <-mr.session.updateCh:
+			if !ok {
+				if mr.session.readerErr != nil {
+					return mr.session.readerErr
 				}
-				mr.mu.Unlock()
-			})
+				return fmt.Errorf("session update channel closed")
+			}
+
+			cid := msg.CID
+			rawBytes := msg.Data
+			var reader *TLReader
+			if rawBytes != nil {
+				reader = NewTLReader(rawBytes)
+			}
+
+			// Dispatch raw update
+			mr.mu.Lock()
+			for _, ch := range mr.subsUpdate {
+				select {
+				case ch <- msg:
+				default:
+				}
+			}
+			mr.mu.Unlock()
+
+			// Also check if we can process it as text message updates
+			if reader != nil {
+				processUpdate(cid, reader, mr.session, func(m IncomingMessage) {
+					mr.mu.Lock()
+					for _, ch := range mr.subsText {
+						select {
+						case ch <- m:
+						default:
+						}
+					}
+					mr.mu.Unlock()
+				})
+			}
 		}
 	}
 }

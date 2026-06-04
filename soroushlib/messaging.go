@@ -480,40 +480,25 @@ type IncomingMessage struct {
 // It calls the handler function for each incoming text message.
 // Returns when the context is cancelled.
 func ListenForMessages(ctx context.Context, session *MTProtoSession, handler func(msg IncomingMessage)) error {
+	session.StartReader(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
-		}
-
-		// Use the parent context directly — NOT a timeout sub-context.
-		// coder/websocket permanently closes the TCP socket when a context expires,
-		// so a 30s timeout would kill the connection on idle groups.
-		cid, reader, err := session.Recv(ctx)
-
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
+		case msg, ok := <-session.updateCh:
+			if !ok {
+				if session.readerErr != nil {
+					return session.readerErr
+				}
+				return fmt.Errorf("session update channel closed")
 			}
 
-			errStr := err.Error()
-			// Permanent connection errors — exit immediately
-			if strings.Contains(errStr, "closed network connection") ||
-				strings.Contains(errStr, "broken pipe") ||
-				strings.Contains(errStr, "connection reset") ||
-				strings.Contains(errStr, "EOF") {
-				log.Printf("[Messaging] Connection lost (permanent): %v", err)
-				return fmt.Errorf("connection lost: %w", err)
+			var reader *TLReader
+			if msg.Data != nil {
+				reader = NewTLReader(msg.Data)
 			}
-
-			// Transient error — log and exit (let caller reconnect)
-			log.Printf("[Messaging] recv error: %v", err)
-			return fmt.Errorf("recv error: %w", err)
+			processUpdate(msg.CID, reader, session, handler)
 		}
-
-		// Handle different update wrapper types
-		processUpdate(cid, reader, session, handler)
 	}
 }
 

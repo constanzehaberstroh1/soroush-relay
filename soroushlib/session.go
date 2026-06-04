@@ -8,6 +8,7 @@ import (
 	"log"
 	"math/big"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -15,6 +16,12 @@ import (
 // ──────────────────────────────────────────────────────────────────────────────
 // MTProtoSession — handles encrypted communication over obfuscated transport
 // ──────────────────────────────────────────────────────────────────────────────
+
+type rpcResponse struct {
+	cid    uint32
+	reader *TLReader
+	err    error
+}
 
 type MTProtoSession struct {
 	Transport *ObfuscatedTransport
@@ -25,16 +32,28 @@ type MTProtoSession struct {
 	SessionID  int64
 
 	seqNo int32
+	mu    sync.Mutex
 
-	mu sync.Mutex
+	// Unified multiplexer fields
+	rpcWaiters map[int64]chan *rpcResponse
+	rpcMu      sync.Mutex
+	updateCh   chan UpdateMessage
+
+	readerCtx    context.Context
+	readerCancel context.CancelFunc
+	readerErr    error
+	readerWG     sync.WaitGroup
+	readerOnce   sync.Once
 }
 
 func NewSession(transport *ObfuscatedTransport) *MTProtoSession {
 	sid := make([]byte, 8)
 	rand.Read(sid)
 	return &MTProtoSession{
-		Transport: transport,
-		SessionID: int64(binary.LittleEndian.Uint64(sid)),
+		Transport:  transport,
+		SessionID:  int64(binary.LittleEndian.Uint64(sid)),
+		rpcWaiters: make(map[int64]chan *rpcResponse),
+		updateCh:   make(chan UpdateMessage, 1000),
 	}
 }
 
@@ -84,17 +103,174 @@ func (s *MTProtoSession) RecvPlain(ctx context.Context) ([]byte, error) {
 	return raw[20 : 20+bodyLen], nil
 }
 
+func (s *MTProtoSession) StartReader(ctx context.Context) {
+	s.readerOnce.Do(func() {
+		s.readerCtx, s.readerCancel = context.WithCancel(ctx)
+		s.readerWG.Add(1)
+		go s.readLoop()
+	})
+}
+
+func (s *MTProtoSession) StopReader() {
+	if s.readerCancel != nil {
+		s.readerCancel()
+	}
+	s.readerWG.Wait()
+}
+
+func (s *MTProtoSession) readLoop() {
+	defer s.readerWG.Done()
+	ctx := s.readerCtx
+
+	for {
+		select {
+		case <-ctx.Done():
+			s.readerErr = ctx.Err()
+			s.cleanupWaiters(ctx.Err())
+			return
+		default:
+		}
+
+		cid, reader, err := s.Recv(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				s.readerErr = ctx.Err()
+			} else {
+				s.readerErr = err
+			}
+			s.cleanupWaiters(s.readerErr)
+			return
+		}
+
+		// Reconstruct raw data for updates if needed
+		var rawBytes []byte
+		if reader != nil {
+			rem := reader.Remaining()
+			rawBytes, _ = reader.ReadRaw(rem)
+			reader = NewTLReader(rawBytes)
+		}
+
+		s.processMessage(cid, reader, rawBytes)
+	}
+}
+
+func (s *MTProtoSession) processMessage(cid uint32, reader *TLReader, rawBytes []byte) {
+	switch cid {
+	case IDMsgContainer:
+		count, _ := reader.ReadInt32()
+		for i := int32(0); i < count; i++ {
+			_, _ = reader.ReadInt64()
+			reader.ReadInt32() // seq_no
+			bodyLen, _ := reader.ReadInt32()
+			subBody, err := reader.ReadRaw(int(bodyLen))
+			if err != nil {
+				continue
+			}
+			if len(subBody) < 4 {
+				continue
+			}
+			subCID := binary.LittleEndian.Uint32(subBody[:4])
+			subReader := NewTLReader(subBody[4:])
+			s.processMessage(subCID, subReader, subBody)
+		}
+
+	case IDBadServerSalt:
+		badMsgID, _ := reader.ReadInt64()
+		reader.ReadInt32() // bad_msg_seqno
+		reader.ReadInt32() // error_code
+		newSalt, _ := reader.ReadInt64()
+		s.mu.Lock()
+		s.ServerSalt = newSalt
+		s.mu.Unlock()
+		log.Printf("[MTProto] Reader: Bad server salt, updated to %d", newSalt)
+
+		// Notify waiter for the request that failed
+		s.rpcMu.Lock()
+		ch, found := s.rpcWaiters[badMsgID]
+		if found {
+			delete(s.rpcWaiters, badMsgID)
+		}
+		s.rpcMu.Unlock()
+
+		if found {
+			ch <- &rpcResponse{
+				err: fmt.Errorf("bad server salt: %d", newSalt),
+			}
+		}
+
+	case IDNewSession:
+		reader.ReadInt64() // first_msg_id
+		reader.ReadInt64() // unique_id
+		newSalt, _ := reader.ReadInt64()
+		s.mu.Lock()
+		s.ServerSalt = newSalt
+		s.mu.Unlock()
+		log.Printf("[MTProto] Reader: New session, salt=%d", newSalt)
+		s.sendUpdate(cid, rawBytes)
+
+	case IDRPCResult:
+		reqMsgID, _ := reader.ReadInt64()
+		innerCID, _ := reader.ReadUint32()
+
+		// Find the waiter for this request
+		s.rpcMu.Lock()
+		ch, found := s.rpcWaiters[reqMsgID]
+		if found {
+			delete(s.rpcWaiters, reqMsgID)
+		}
+		s.rpcMu.Unlock()
+
+		if found {
+			ch <- &rpcResponse{
+				cid:    innerCID,
+				reader: reader,
+			}
+		} else {
+			log.Printf("[MTProto] Reader: Received RPC result for unknown msgID %d", reqMsgID)
+			s.sendUpdate(cid, rawBytes)
+		}
+
+	default:
+		// Unsolicited updates / other messages
+		s.sendUpdate(cid, rawBytes)
+	}
+}
+
+func (s *MTProtoSession) sendUpdate(cid uint32, data []byte) {
+	select {
+	case s.updateCh <- UpdateMessage{CID: cid, Data: data}:
+	default:
+		// Drop if buffer full to avoid blocking the main read loop
+	}
+}
+
+func (s *MTProtoSession) cleanupWaiters(err error) {
+	s.rpcMu.Lock()
+	defer s.rpcMu.Unlock()
+	for msgID, ch := range s.rpcWaiters {
+		ch <- &rpcResponse{err: err}
+		delete(s.rpcWaiters, msgID)
+	}
+}
+
 // Send sends an encrypted MTProto message
 func (s *MTProtoSession) Send(ctx context.Context, body []byte, contentRelated bool) (int64, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	msgID := s.newMsgID()
 	seq := s.nextSeq(contentRelated)
+	s.mu.Unlock()
+	return s.sendWithMsgID(ctx, body, contentRelated, msgID, seq)
+}
+
+func (s *MTProtoSession) sendWithMsgID(ctx context.Context, body []byte, contentRelated bool, msgID int64, seq int32) (int64, error) {
+	s.mu.Lock()
+	salt := s.ServerSalt
+	sessionID := s.SessionID
+	s.mu.Unlock()
 
 	inner := make([]byte, 32+len(body))
-	binary.LittleEndian.PutUint64(inner[0:], uint64(s.ServerSalt))
-	binary.LittleEndian.PutUint64(inner[8:], uint64(s.SessionID))
+	binary.LittleEndian.PutUint64(inner[0:], uint64(salt))
+	binary.LittleEndian.PutUint64(inner[8:], uint64(sessionID))
 	binary.LittleEndian.PutUint64(inner[16:], uint64(msgID))
 	binary.LittleEndian.PutUint32(inner[24:], uint32(seq))
 	binary.LittleEndian.PutUint32(inner[28:], uint32(len(body)))
@@ -134,72 +310,47 @@ func (s *MTProtoSession) Send(ctx context.Context, body []byte, contentRelated b
 // It automatically handles bad_server_salt by updating the salt and retrying.
 // Returns the response constructor ID and TLReader, or an error.
 func (s *MTProtoSession) SendAndWait(ctx context.Context, body []byte, contentRelated bool) (uint32, *TLReader, error) {
+	s.StartReader(ctx)
+
 	for attempt := 0; attempt < 3; attempt++ {
-		_, err := s.Send(ctx, body, contentRelated)
+		if s.readerErr != nil {
+			return 0, nil, fmt.Errorf("reader is offline: %w", s.readerErr)
+		}
+
+		ch := make(chan *rpcResponse, 1)
+
+		s.mu.Lock()
+		msgID := s.newMsgID()
+		seq := s.nextSeq(contentRelated)
+		s.mu.Unlock()
+
+		s.rpcMu.Lock()
+		s.rpcWaiters[msgID] = ch
+		s.rpcMu.Unlock()
+
+		_, err := s.sendWithMsgID(ctx, body, contentRelated, msgID, seq)
 		if err != nil {
+			s.rpcMu.Lock()
+			delete(s.rpcWaiters, msgID)
+			s.rpcMu.Unlock()
 			return 0, nil, fmt.Errorf("send: %w", err)
 		}
 
-		// Read response — use parent ctx (coder/websocket kills the socket on context expiry)
-		cid, reader, err := s.Recv(ctx)
-		if err != nil {
-			return 0, nil, fmt.Errorf("recv: %w", err)
-		}
-
-		switch cid {
-		case IDBadServerSalt:
-			// Update salt and retry
-			reader.ReadInt64() // bad_msg_id
-			reader.ReadInt32() // bad_msg_seqno
-			reader.ReadInt32() // error_code
-			newSalt, _ := reader.ReadInt64()
-			s.ServerSalt = newSalt
-			log.Printf("[MTProto] Bad server salt, updated to %d. Retrying (attempt %d)...", newSalt, attempt+1)
-			continue
-
-		case IDNewSession:
-			// Update salt from new session and retry
-			reader.ReadInt64() // first_msg_id
-			reader.ReadInt64() // unique_id
-			newSalt, _ := reader.ReadInt64()
-			s.ServerSalt = newSalt
-			log.Printf("[MTProto] New session, salt=%d. Retrying (attempt %d)...", newSalt, attempt+1)
-			continue
-
-		case IDMsgsAck:
-			// Just an ACK, need to read the actual response
-			cid2, reader2, err2 := s.Recv(ctx)
-			if err2 != nil {
-				return 0, nil, fmt.Errorf("recv after ack: %w", err2)
-			}
-			return cid2, reader2, nil
-
-		case IDMsgContainer:
-			// Parse container to find the actual RPC result
-			count, _ := reader.ReadInt32()
-			for i := int32(0); i < count; i++ {
-				reader.ReadInt64() // msg_id
-				reader.ReadInt32() // seq_no
-				bodyLen, _ := reader.ReadInt32()
-				subBody, _ := reader.ReadRaw(int(bodyLen))
-				if len(subBody) >= 4 {
-					subCID := binary.LittleEndian.Uint32(subBody[:4])
-					if subCID == IDBadServerSalt && len(subBody) >= 28 {
-						newSalt := int64(binary.LittleEndian.Uint64(subBody[20:28]))
-						s.ServerSalt = newSalt
-						log.Printf("[MTProto] Bad salt in container, updated to %d", newSalt)
-						break // will retry in outer loop
-					}
-					if subCID == IDRPCResult || subCID == IDUpdates || subCID == IDUpdateShortSentMessage {
-						subReader := NewTLReader(subBody[4:])
-						return subCID, subReader, nil
-					}
+		select {
+		case <-ctx.Done():
+			s.rpcMu.Lock()
+			delete(s.rpcWaiters, msgID)
+			s.rpcMu.Unlock()
+			return 0, nil, ctx.Err()
+		case resp := <-ch:
+			if resp.err != nil {
+				if strings.Contains(resp.err.Error(), "bad server salt") {
+					log.Printf("[MTProto] SendAndWait: Retrying request %d due to bad salt (attempt %d)...", msgID, attempt+1)
+					continue
 				}
+				return 0, nil, resp.err
 			}
-			continue // retry if only salt updates in container
-
-		default:
-			return cid, reader, nil
+			return resp.cid, resp.reader, nil
 		}
 	}
 	return 0, nil, fmt.Errorf("SendAndWait: failed after 3 retries (bad_server_salt)")
@@ -209,80 +360,16 @@ func (s *MTProtoSession) SendAndWait(ctx context.Context, body []byte, contentRe
 // bad_server_salt / new_session_created responses to prime the session salt.
 // Call this BEFORE starting ListenForMessages to ensure the salt is correct.
 func (s *MTProtoSession) WarmUpSession(ctx context.Context) error {
-	// Build a minimal updates.getState request (constructor 0xedd4882a)
 	w := NewTLWriter()
 	w.WriteUint32(0xEDD4882A) // updates.getState
 	body := w.GetBytes()
 
 	log.Println("[MTProto] Warming up session (updates.getState)...")
-
-	for attempt := 0; attempt < 3; attempt++ {
-		_, err := s.Send(ctx, body, true)
-		if err != nil {
-			return fmt.Errorf("warm up send: %w", err)
-		}
-
-		cid, reader, err := s.Recv(ctx)
-		if err != nil {
-			return fmt.Errorf("warm up recv: %w", err)
-		}
-
-		switch cid {
-		case IDBadServerSalt:
-			reader.ReadInt64() // bad_msg_id
-			reader.ReadInt32() // bad_msg_seqno
-			reader.ReadInt32() // error_code
-			newSalt, _ := reader.ReadInt64()
-			s.ServerSalt = newSalt
-			log.Printf("[MTProto] Warm-up: updated salt to %d (attempt %d)", newSalt, attempt+1)
-			continue
-
-		case IDNewSession:
-			reader.ReadInt64() // first_msg_id
-			reader.ReadInt64() // unique_id
-			newSalt, _ := reader.ReadInt64()
-			s.ServerSalt = newSalt
-			log.Printf("[MTProto] Warm-up: new session, salt=%d (attempt %d)", newSalt, attempt+1)
-			continue
-
-		case IDMsgsAck:
-			// ACK received, try to read the actual response
-			s.Recv(ctx)
-			log.Println("[MTProto] Warm-up: session ready ✅")
-			return nil
-
-		case IDMsgContainer:
-			// Container — check for salt updates inside, otherwise session is ready
-			count, _ := reader.ReadInt32()
-			saltUpdated := false
-			for i := int32(0); i < count; i++ {
-				reader.ReadInt64() // msg_id
-				reader.ReadInt32() // seq_no
-				bodyLen, _ := reader.ReadInt32()
-				subBody, _ := reader.ReadRaw(int(bodyLen))
-				if len(subBody) >= 4 {
-					subCID := binary.LittleEndian.Uint32(subBody[:4])
-					if subCID == IDBadServerSalt && len(subBody) >= 28 {
-						newSalt := int64(binary.LittleEndian.Uint64(subBody[20:28]))
-						s.ServerSalt = newSalt
-						saltUpdated = true
-						log.Printf("[MTProto] Warm-up: salt from container = %d", newSalt)
-					}
-				}
-			}
-			if saltUpdated {
-				continue
-			}
-			log.Println("[MTProto] Warm-up: session ready ✅")
-			return nil
-
-		default:
-			// Got an actual response — session is warm
-			log.Printf("[MTProto] Warm-up: got CID=0x%08X, session ready ✅", cid)
-			return nil
-		}
+	_, _, err := s.SendAndWait(ctx, body, true)
+	if err != nil {
+		return fmt.Errorf("warm up: %w", err)
 	}
-	log.Println("[MTProto] Warm-up: completed after 3 attempts")
+	log.Println("[MTProto] Warm-up successful ✅")
 	return nil
 }
 
