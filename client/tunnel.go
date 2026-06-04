@@ -179,6 +179,7 @@ func runTunnelFlow(ctx context.Context, cancel context.CancelFunc) {
 		return
 	}
 	connCancel()
+	session.StartReader(ctx)
 	recordSystemLog("[Tunnel] MTProto transport connected to wss://im-server.splus.ir/apiws", "success")
 
 	// Start MessageRouter

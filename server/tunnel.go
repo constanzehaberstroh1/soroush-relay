@@ -172,6 +172,7 @@ func runGroupObserverOnce(ctx context.Context) error {
 	connCancel()
 	defer transport.Disconnect()
 
+	session.StartReader(ctx)
 	recordSystemLog("[GroupObserver] Connected to Soroush ✅", "success")
 
 	serverTunnel.mu.Lock()
