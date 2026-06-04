@@ -231,7 +231,7 @@ func (s *MTProtoSession) processMessage(cid uint32, reader *TLReader, rawBytes [
 		}
 
 	default:
-		// Unsolicited updates / other messages
+		log.Printf("[MTProto] Reader: Unsolicited update received: CID=0x%08X", cid)
 		s.sendUpdate(cid, rawBytes)
 	}
 }

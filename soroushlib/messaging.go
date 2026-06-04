@@ -504,6 +504,7 @@ func ListenForMessages(ctx context.Context, session *MTProtoSession, handler fun
 
 // processUpdate handles MTProto update messages and extracts text messages
 func processUpdate(cid uint32, r *TLReader, session *MTProtoSession, handler func(msg IncomingMessage)) {
+	log.Printf("[Messaging] Processing update: CID=0x%08X", cid)
 	switch cid {
 	case IDMsgsAck:
 		// Acknowledgment — ignore
