@@ -183,19 +183,30 @@ func runGroupObserverOnce(ctx context.Context) error {
 
 	serverID := account.ID
 
-	// Send initial heartbeat wrapped in initConnection (required by Soroush for new sessions).
+	// 1. Initialize connection and subscribe to updates by fetching dialogs (getDialogs) wrapped in initConnection.
 	// Without initConnection, Soroush processes the RPC then closes the WebSocket.
+	initBody := soroushlib.BuildGetDialogsRequest()
+	wrappedInit := soroushlib.WrapInitConnection(soroushlib.SoroushAppID, initBody)
+
+	initCtx, initCancel := context.WithTimeout(ctx, 30*time.Second)
+	_, _, err := session.SendAndWait(initCtx, wrappedInit, true)
+	initCancel()
+	if err != nil {
+		recordSystemLog(fmt.Sprintf("[GroupObserver] Connection initialization (getDialogs) failed: %v", err), "warn")
+	} else {
+		recordSystemLog("[GroupObserver] Connection initialized and dialog list loaded ✅", "success")
+	}
+
+	// 2. Send initial heartbeat to the group chat.
 	hb := soroushlib.NewHeartbeat(serverID, account.SoroushUserID, account.AccessHash, 0)
 	encoded, err := soroushlib.EncodeGroupCommand(hb, psk)
 	if err != nil {
 		recordSystemLog(fmt.Sprintf("[GroupObserver] Encode heartbeat failed: %v", err), "error")
 		return fmt.Errorf("encode heartbeat: %w", err)
 	}
-	hbBody := soroushlib.BuildSendChannelMessage(chatID, chatAH, encoded, time.Now().UnixNano())
-	wrappedBody := soroushlib.WrapInitConnection(soroushlib.SoroushAppID, hbBody)
 
 	hbCtx, hbCancel := context.WithTimeout(ctx, 30*time.Second)
-	_, _, err = session.SendAndWait(hbCtx, wrappedBody, true)
+	err = soroushlib.SendChannelMessage(hbCtx, session, chatID, chatAH, encoded)
 	hbCancel()
 	if err != nil {
 		recordSystemLog(fmt.Sprintf("[GroupObserver] Initial heartbeat failed: %v", err), "warn")
