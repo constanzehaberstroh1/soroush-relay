@@ -253,6 +253,7 @@ func runGroupObserverOnce(ctx context.Context) error {
 				if !ok {
 					return
 				}
+				recordSystemLog(fmt.Sprintf("[GroupObserver] Received message: ChatID=%d, FromUID=%d, IsGroup=%t, TextLen=%d", msg.ChatID, msg.FromUserID, msg.IsGroup, len(msg.Text)), "info")
 				if !msg.IsGroup || msg.ChatID != chatID {
 					continue
 				}
@@ -262,6 +263,7 @@ func runGroupObserverOnce(ctx context.Context) error {
 
 				cmd, err := soroushlib.DecodeGroupCommand(msg.Text, psk)
 				if err != nil {
+					recordSystemLog(fmt.Sprintf("[GroupObserver] Failed to decode group command: %v", err), "warn")
 					continue
 				}
 
