@@ -570,7 +570,7 @@ func processUpdate(cid uint32, r *TLReader, session *MTProtoSession, handler fun
 		// Single update wrapper
 		innerCID, _ := r.ReadUint32()
 		if innerCID == IDUpdateNewMessage || innerCID == IDUpdateNewChannelMessage {
-			parseUpdateNewMessage(r, handler)
+			parseUpdateNewMessage(r, session, handler)
 		}
 		return
 
@@ -596,9 +596,10 @@ func parseUpdateShortMessage(r *TLReader, handler func(msg IncomingMessage)) {
 }
 
 // parseUpdateNewMessage extracts a message from updateNewMessage
-func parseUpdateNewMessage(r *TLReader, handler func(msg IncomingMessage)) {
+func parseUpdateNewMessage(r *TLReader, session *MTProtoSession, handler func(msg IncomingMessage)) {
 	// message constructor
 	msgCID, _ := r.ReadUint32()
+	session.Log(fmt.Sprintf("[Messaging] parseUpdateNewMessage: msgCID=0x%08X", msgCID), "info")
 	if msgCID != IDMessage {
 		return
 	}
@@ -636,6 +637,7 @@ func parseUpdateNewMessage(r *TLReader, handler func(msg IncomingMessage)) {
 	text, _ := r.ReadString()
 
 	if fromUserID != 0 {
+		session.Log(fmt.Sprintf("[Messaging] parseUpdateNewMessage: Parsed ID=%d FromUserID=%d ChatID=%d Text=%s", msgID, fromUserID, chatID, truncate(text, 40)), "info")
 		handler(IncomingMessage{
 			FromUserID: fromUserID,
 			Text:       text,
@@ -643,6 +645,8 @@ func parseUpdateNewMessage(r *TLReader, handler func(msg IncomingMessage)) {
 			ChatID:     chatID,
 			IsGroup:    isGroup,
 		})
+	} else {
+		session.Log(fmt.Sprintf("[Messaging] parseUpdateNewMessage: DISCARDED because FromUserID is 0. ChatID=%d Text=%s", chatID, truncate(text, 40)), "info")
 	}
 }
 
@@ -656,7 +660,7 @@ func parseUpdates(r *TLReader, session *MTProtoSession, handler func(msg Incomin
 		updateCID, _ := r.ReadUint32()
 		session.Log(fmt.Sprintf("[Messaging] parseUpdates: item %d/%d updateCID=0x%08X", i+1, count, updateCID), "info")
 		if updateCID == IDUpdateNewMessage || updateCID == IDUpdateNewChannelMessage {
-			parseUpdateNewMessage(r, handler)
+			parseUpdateNewMessage(r, session, handler)
 		}
 		// Skip other update types gracefully
 	}

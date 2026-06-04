@@ -269,13 +269,16 @@ func runTunnelFlow(ctx context.Context, cancel context.CancelFunc) {
 
 		go func() {
 			for msg := range textSub {
+				recordSystemLog(fmt.Sprintf("[Tunnel] Subscription received msg: ChatID=%d FromUID=%d Text=%s", msg.ChatID, msg.FromUserID, msg.Text), "info")
 				if !msg.IsGroup || msg.ChatID != config.GroupChatID || msg.FromUserID == clientAcc.SoroushUserID {
 					continue
 				}
 				cmd, err := soroushlib.DecodeGroupCommand(msg.Text, psk)
 				if err != nil {
+					recordSystemLog(fmt.Sprintf("[Tunnel] Failed to decode group command: %v", err), "warn")
 					continue
 				}
+				recordSystemLog(fmt.Sprintf("[Tunnel] Decoded command: %s (CID: %s, SID: %s)", cmd.Cmd, cmd.CID, cmd.SID), "info")
 				if cmd.Cmd == soroushlib.CmdOffer && cmd.CID == clientID {
 					offer = cmd
 					discoverCancel() // Stop broadcasting DISCOVER
